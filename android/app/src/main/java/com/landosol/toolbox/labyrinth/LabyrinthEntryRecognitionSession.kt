@@ -309,7 +309,7 @@ internal fun labyrinthEventFreeRoleSelectionOwnsFrame(
     hasOpeningViewport: Boolean,
     shopChoiceImprintPending: Boolean = false,
     /**
-     * Whether a route is being executed. Once it is, a full-roster picker can only have been
+     * Whether a route has passed the opening start. Once it has, a full-roster picker can only have been
      * opened by this run (an event's free pick or a shop 选择印记); the opening selector is over.
      *
      * The node-type and imprint-pending flags are better evidence when they survive, but they are
@@ -1671,7 +1671,7 @@ class LabyrinthEntryRecognitionSession(
             message = if (dryRun) {
                 "入口只读识别已启动"
             } else {
-                listOfNotNull(executionGateMessage, "半自动流程已启动，等待游戏切到前台").joinToString("；")
+                listOfNotNull(executionGateMessage, "路线自动执行已启动，等待游戏切到前台").joinToString("；")
             },
         )
         val attached = overlayCoordinator.attach(
@@ -2038,10 +2038,14 @@ class LabyrinthEntryRecognitionSession(
             )
             nodeLog("existing-run resume handed off directly to role reward page: ${pageState.name}")
         }
+        val routeHasPassedOpening = labyrinthRouteHasPassedOpening(
+            nodeSession?.getState(),
+            hasNodeTransition = pendingNodeTransition != null || activeNodeType != null,
+        )
         if (!current.dryRun && labyrinthShouldResumeOpeningSelection(
                 entryPhaseComplete = entryPhaseComplete,
                 result = result,
-                routeActive = nodeSession != null,
+                routeActive = routeHasPassedOpening,
             )
         ) {
             entryPhaseComplete = false
@@ -2270,7 +2274,7 @@ class LabyrinthEntryRecognitionSession(
             roleRewardPage = postEntryIsRoleRewardPage(result),
             hasOpeningViewport = result.openingCharacterSelection != null,
             shopChoiceImprintPending = shopChoiceImprintRolePending,
-            routeActive = nodeSession != null,
+            routeActive = routeHasPassedOpening,
         )
         if (eventFreeRoleSelection) {
             if (activeNodeType == null && persistedCurrentNode?.blockType == LabyrinthNodeTypes.EVENT) {

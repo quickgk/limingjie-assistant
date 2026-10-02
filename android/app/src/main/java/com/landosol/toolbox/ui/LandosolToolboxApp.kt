@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationRail
@@ -14,6 +15,7 @@ import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Typography
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -330,13 +332,36 @@ private fun LabyrinthRoute(
     batchHaltReason: com.landosol.toolbox.labyrinth.batch.LabyrinthBatchHaltReason?,
     onRequestCapture: ((() -> Unit) -> Unit),
 ) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    var showAccessibilityDialog by rememberSaveable { mutableStateOf(false) }
     var notificationAccount by remember { mutableStateOf<Long?>(null) }
     var notificationGuildId by remember { mutableStateOf<Int?>(null) }
     var showStrategies by rememberSaveable { mutableStateOf(false) }
     var strategySaving by remember { mutableStateOf(false) }
     var strategyMessage by remember { mutableStateOf<String?>(null) }
     val savedStrategy by application.labyrinthStrategySettings.state.collectAsStateWithLifecycle()
+    if (showAccessibilityDialog) {
+        AlertDialog(
+            onDismissRequest = { showAccessibilityDialog = false },
+            title = { Text("需要无障碍权限") },
+            text = {
+                Text(
+                    "尚未获取无障碍权限或服务未连接。请前往系统无障碍设置，开启“黎明界助手”服务。" +
+                        "\n\n若开关已开启，请关闭后重新开启；返回助手后再次启动任务。",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showAccessibilityDialog = false
+                    context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                }) { Text("前往设置") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAccessibilityDialog = false }) { Text("取消") }
+            },
+        )
+    }
     if (showStrategies) {
         LabyrinthStrategySettingsScreen(
             loadRoleRatings = application::loadLabyrinthRoleRatings,
@@ -408,11 +433,7 @@ private fun LabyrinthRoute(
             // 先检查无障碍实际连接状态，再申请 MediaProjection。否则服务未连接时，
             // 用户点击“执行入口流程”仍会先弹录屏授权并启动录屏。
             if (!LandosolAccessibilityService.isConnected()) {
-                scope.launch {
-                    application.labyrinthEntryRecognitionSession.startAutomation(
-                        accountId = state.selectedAccount?.id,
-                    )
-                }
+                showAccessibilityDialog = true
             } else {
                 onRequestCapture {
                     scope.launch {
@@ -428,7 +449,7 @@ private fun LabyrinthRoute(
         },
         onStartAutoRun = { goals ->
             if (!LandosolAccessibilityService.isConnected()) {
-                labyrinthViewModel.reportMessage("无障碍服务未连接；若系统开关显示已开启，请关闭后重新开启")
+                showAccessibilityDialog = true
             } else {
                 onRequestCapture {
                     application.startLabyrinthAutoRun(

@@ -14,6 +14,7 @@ import com.landosol.toolbox.labyrinth.vision.LabyrinthEntryPageState
 import com.landosol.toolbox.labyrinth.vision.EntryAnchorId
 import com.landosol.toolbox.labyrinth.vision.EntryAnchorMatch
 import com.landosol.toolbox.labyrinth.node.LabyrinthNodeTypes
+import com.landosol.toolbox.labyrinth.node.NodeSessionState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -457,6 +458,57 @@ class LabyrinthPageRuntimePolicyTest {
         assertEquals(false, labyrinthShouldResumeOpeningSelection(true, reward))
         assertEquals(false, labyrinthShouldResumeOpeningSelection(true, result(LabyrinthEntryPageState.NODE_SELECTION)))
         assertEquals(false, labyrinthShouldResumeOpeningSelection(true, result(LabyrinthEntryPageState.INITIAL_CHARACTER_SELECTION)))
+    }
+
+    @Test
+    fun `first map glimpse cannot send the delayed opening selector to event free picks`() {
+        // 2026-09-26 bundle 190009: an active home led to two map frames then the 0-of-3
+        // opening selector. A node session existed, but only the start had been visited.
+        val picker = result(
+            LabyrinthEntryPageState.INITIAL_CHARACTER_SELECTION,
+            anchorScores = mapOf(EntryAnchorId.SELECTION_HEADER_STANDARD to 0.995),
+        )
+        val opening = NodeSessionState(currentArea = 1, currentNodeId = 10101L, visitedNodes = listOf(10101L))
+        val routeActive = labyrinthRouteHasPassedOpening(opening)
+        assertFalse(routeActive)
+        assertTrue(labyrinthShouldResumeOpeningSelection(true, picker, routeActive))
+        assertFalse(labyrinthEventFreeRoleSelectionOwnsFrame(
+            pageState = picker.observation.state,
+            activeNodeType = LabyrinthNodeTypes.START,
+            roleRewardPage = false,
+            hasOpeningViewport = true,
+            routeActive = routeActive,
+        ))
+
+        // A picker inside a real run stays owned by the route, including after node-type
+        // memory is lost and at a later area's start following a Boss.
+        for (progressed in listOf(
+            opening.copy(currentNodeId = 10102L, visitedNodes = listOf(10101L, 10102L)),
+            NodeSessionState(currentArea = 2, currentNodeId = 20101L, visitedNodes = listOf(20101L)),
+        )) {
+            val progressedRoute = labyrinthRouteHasPassedOpening(progressed)
+            assertTrue(progressedRoute)
+            assertFalse(labyrinthShouldResumeOpeningSelection(true, picker, progressedRoute))
+            assertTrue(labyrinthEventFreeRoleSelectionOwnsFrame(
+                pageState = picker.observation.state,
+                activeNodeType = null,
+                roleRewardPage = false,
+                hasOpeningViewport = true,
+                routeActive = progressedRoute,
+            ))
+        }
+        assertFalse(labyrinthRouteHasPassedOpening(null))
+        // The first event may open a picker before its destination frame updates visitedNodes.
+        val firstEventPending = labyrinthRouteHasPassedOpening(opening, hasNodeTransition = true)
+        assertTrue(firstEventPending)
+        assertFalse(labyrinthShouldResumeOpeningSelection(true, picker, firstEventPending))
+        assertTrue(labyrinthEventFreeRoleSelectionOwnsFrame(
+            pageState = picker.observation.state,
+            activeNodeType = LabyrinthNodeTypes.EVENT,
+            roleRewardPage = false,
+            hasOpeningViewport = true,
+            routeActive = firstEventPending,
+        ))
     }
 
     @Test

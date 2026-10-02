@@ -45,6 +45,7 @@
 - 无障碍后端、前台在场检测、启动与重启客户端都在每次使用时读取目标包名，切换账号即切换目标。
 - 解析不出目标时，前台校验收到一个永不匹配的占位包名 `com.landosol.toolbox.no-game-client`，所有动作被拒绝。`AndroidAccessibilityActionBackend` 的目标包名是非空类型，没有「不校验前台」这一档。
 - 启动 Intent 去掉 `package` 字段：带着它时 `Intent.filterEquals` 与桌面启动器建的任务根不相等，系统会在现有任务上再建一个 SplashActivity，渠道客户端的 PermissionActivity 随后永久盖住 MainActivity（黑屏）。
+- 启动闸门按目标游戏包是否已在前台判断；已在前台时直接接管识别，不重发启动 Intent。无障碍记录的 Activity 名可能停留在已经关闭的 SDK 公告页，不能要求它等于 MainActivity，否则冷启动导航完成后会拒绝启动单局（2026-09-26 日志包 183318）。接管后的点击仍受页面识别与前台包校验约束。
 
 ## 账号表里的服务器
 

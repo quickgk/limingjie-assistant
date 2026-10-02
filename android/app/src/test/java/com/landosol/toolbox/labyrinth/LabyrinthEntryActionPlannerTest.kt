@@ -365,6 +365,36 @@ class LabyrinthEntryActionPlannerTest {
     }
 
     @Test
+    fun `opening search swipes when scrollbar is absent or full height and portraits are unresolved`() {
+        for (visibleThumb in listOf(false, true)) {
+            val planner = LabyrinthEntryActionPlanner(
+                LabyrinthEntryActionPlannerConfig(stableFrames = 1, openingRosterScrollIntervalMillis = 1L),
+            )
+            planner.configureOpeningRoster(3)
+            val unresolved = openingMatch("9999", "未知", 200).copy(characterId = null, trusted = false)
+            val measured = openingViewport(position = 0.0, canScroll = false)
+            val viewport = measured.copy(
+                visibleCharacters = listOf(unresolved),
+                scrollbar = measured.scrollbar.copy(
+                    visible = visibleThumb,
+                    thumbRect = measured.scrollbar.thumbRect.takeIf { visibleThumb },
+                ),
+            )
+            val decision = planner.decide(
+                state = LabyrinthEntryPageState.INITIAL_CHARACTER_SELECTION,
+                frameWidth = 1920,
+                frameHeight = 1080,
+                nowMillis = 0L,
+                openingCharacterMatches = listOf(unresolved),
+                openingCharacterSelection = viewport,
+            ) as LabyrinthEntryActionDecision.Execute
+            assertEquals(LabyrinthEntryActionKind.SCROLL_INITIAL_CHARACTERS, decision.kind)
+            val swipe = decision.action as AutomationAction.Swipe
+            assertTrue(swipe.start.y > swipe.end.y)
+        }
+    }
+
+    @Test
     fun `configured opening roster stops only after bottom viewport confirms missing targets`() {
         val planner = LabyrinthEntryActionPlanner(
             LabyrinthEntryActionPlannerConfig(

@@ -7,15 +7,15 @@ import org.junit.Test
 
 class LabyrinthOpeningRosterOverrideTest {
     @Test fun `saren orphanage opens with the requested three`() {
-        // 2026-09-19, by request: 女仆 / 花女仆 / 水电.
+        // 女仆 / 花女仆 / 圣诞咲恋.
         val config = requireNotNull(LabyrinthOpeningRosterCatalog.configFor(SAREN))
         assertEquals(
-            listOf(listOf("1025"), listOf("1308"), listOf("1103")),
+            listOf(listOf("1025"), listOf("1308"), listOf("1145")),
             config.slots.map { slot -> slot.candidates.map { it.characterId } },
         )
         val decision = LabyrinthOpeningRosterPolicy(config).choose(setOf("1025", "1308", "1103", "1145"))
         assertEquals(
-            listOf("1025", "1308", "1103"),
+            listOf("1025", "1308", "1145"),
             (decision as LabyrinthOpeningRosterDecision.Ready).characters.map { it.characterId },
         )
     }

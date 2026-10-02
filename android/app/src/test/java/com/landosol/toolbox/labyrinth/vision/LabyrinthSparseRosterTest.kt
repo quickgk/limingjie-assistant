@@ -16,6 +16,18 @@ import org.junit.Test
  */
 class LabyrinthSparseRosterTest {
     @Test
+    fun `homare and eriko keep distinct identities in the current member strip`() {
+        val frame = screenshot("team-homare-eriko-20261002.png")
+        val templates = iconTemplates()
+        for (roster in listOf(null, setOf("1067", "1027"))) {
+            val recognizer = LabyrinthBattleTeamRecognizer(templates = templates, requiredStableFrames = 1)
+            val result = recognizer.recognize(frame, rosterCharacterIds = roster.orEmpty())
+            assertEquals(result.selectedCharacters.toString(), listOf("1067", "1027"),
+                result.selectedCharacters.map { it.characterId })
+        }
+    }
+
+    @Test
     fun `one remaining card is located and identified`() {
         val frame = screenshot(FIXTURE)
         val recognizer = LabyrinthBattleTeamRecognizer(templates = iconTemplates(), requiredStableFrames = 1)

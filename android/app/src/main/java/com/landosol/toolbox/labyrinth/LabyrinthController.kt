@@ -343,7 +343,13 @@ class LabyrinthController(
         }
         if (account.id != settingsAccountId) return
         explicitlyReadInitialOpening = null
-        val config = parseConfig(account.id) ?: return
+        val base = parseConfig(account.id) ?: return
+        val launchGuildId = guildIdOverride ?: base.guildId
+        if (LabyrinthRerollOptions.guilds.none { it.guildId == launchGuildId }) {
+            reportMessage("请选择有效的开局公会")
+            return
+        }
+        val config = labyrinthStandaloneRerollConfig(base, launchGuildId)
         if (config.retireExisting && !retreatConfirmed) {
             reportMessage("开始前请确认允许彻底撤退现有开局")
             return

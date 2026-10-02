@@ -522,7 +522,8 @@ class LabyrinthEntryActionPlanner(
             }
             if (
                 openingCharacterSelection?.recognitionState == LabyrinthBattleTeamRecognitionState.STABLE &&
-                recognizedOpening.isEmpty()
+                openingCharacterMatches.isEmpty() &&
+                openingCharacterSelection.visibleCharacters.isEmpty()
             ) {
                 // At either end elastic scrolling can expose a temporary blank band before the
                 // list rebounds to the first/last real row. A cardless frame is not a new page or
@@ -567,7 +568,11 @@ class LabyrinthEntryActionPlanner(
             val viewport = openingCharacterSelection
                 ?: return LabyrinthEntryActionDecision.Wait("初始角色视口尚未生成，等待滚动条与卡片布局识别")
             val scrollbar = viewport.scrollbar
-            val atBottom = !scrollbar.canScroll || scrollbar.position >= OPENING_SCROLL_BOTTOM_POSITION
+            // Missing/full-height thumbs carry no measured position. Like battle-roster search,
+            // keep swiping until an actual bottom thumb or visible content end proves the boundary.
+            val atBottom = scrollbar.contentEndVisible ||
+                (scrollbar.visible && scrollbar.thumbRect != null && scrollbar.canScroll &&
+                    scrollbar.position.isFinite() && scrollbar.position >= OPENING_SCROLL_BOTTOM_POSITION)
             if (atBottom) {
                 openingRosterBottomMissFrames++
                 return if (openingRosterBottomMissFrames >= config.openingRosterBottomStableFrames) {

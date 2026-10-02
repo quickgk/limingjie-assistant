@@ -292,14 +292,13 @@ class LandosolToolboxApplication : Application() {
             },
             gameLauncher = gameLauncher@{
                 val target = gamePackageName ?: return@gameLauncher false
-                // 游戏已在 MainActivity 前台时绝不重发启动 Intent：
+                // 目标游戏包已在前台时绝不重发启动 Intent：
                 // 重发会拉起 SplashActivity → PCR 自身弹出 PermissionActivity →
                 // MainActivity 被 stop、Surface 消失 → 黑屏。
                 val foregroundActivity = LandosolAccessibilityService.foregroundActivity()
                 val decision = GameClientLaunchGate.decide(
                     targetPackage = target,
                     foregroundPackage = LandosolAccessibilityService.foregroundPackage(),
-                    activity = foregroundActivity,
                 )
                 Log.i(APP_LOG_TAG, "游戏启动决策：$decision 前台Activity=$foregroundActivity")
                 GameClientLaunchGate.execute(decision) {

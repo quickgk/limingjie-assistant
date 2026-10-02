@@ -661,8 +661,7 @@ private fun EntryRecognitionCard(
     onStop: () -> Unit,
 ) {
     SelectionCard(
-        "半自动路线执行",
-        "程序负责进入黎明界、按保存路线点节点并推进结算；角色、战斗编组与遗物由你选择",
+        "路线执行",
     ) {
         val result = state.lastResult
         if (result == null) {

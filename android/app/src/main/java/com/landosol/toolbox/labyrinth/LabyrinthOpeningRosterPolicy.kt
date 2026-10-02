@@ -162,11 +162,11 @@ object LabyrinthOpeningRosterCatalog {
         LabyrinthOpeningRosterConfig(
             guildId = 3,
             guildName = "咲恋救济院",
-            // 2026-09-19, by request: 女仆 / 花女仆 / 水电.
+            // 女仆 / 花女仆 / 圣诞咲恋.
             slots = listOf(
                 slot(character("1025", "铃莓")),
                 slot(character("1308", "铃莓(春日)")),
-                slot(character("1103", "咲恋(夏日)")),
+                slot(character("1145", "咲恋(圣诞节)")),
             ),
         ),
         LabyrinthOpeningRosterConfig(

@@ -3,22 +3,17 @@ package com.landosol.toolbox.automation
 enum class GameLaunchDecision { ALREADY_FOREGROUND, LAUNCH_GAME, BLOCKED }
 
 /**
- * 启动闸门：游戏已在 MainActivity 前台时不得重发启动 Intent。
+ * 启动闸门：目标游戏包已在前台时不得重发启动 Intent。
  * 重发会拉起 SplashActivity，PCR 随即弹出 PermissionActivity，
  * MainActivity 被 stop、Surface 消失 —— 即历史上的小米黑屏。
- * 实现照搬 v0.0.8 已验证版本。
+ * 无障碍 Activity 名可能停留在已经关闭的 SDK 公告页，不能用它判断游戏能否接管。
+ * 接管只启动画面识别；是否点击仍由页面规划器和动作后端的前台包校验决定。
  */
 object GameClientLaunchGate {
-    const val MAIN_ACTIVITY = "com.bilibili.priconne.MainActivity"
-    const val PERMISSION_ACTIVITY = "com.bilibili.permission.PermissionActivity"
-
-    fun decide(targetPackage: String?, foregroundPackage: String?, activity: String?): GameLaunchDecision {
-        if (targetPackage == null || activity == PERMISSION_ACTIVITY) return GameLaunchDecision.BLOCKED
+    fun decide(targetPackage: String?, foregroundPackage: String?): GameLaunchDecision {
+        if (targetPackage == null) return GameLaunchDecision.BLOCKED
         if (foregroundPackage == targetPackage) {
-            // Never re-enter the launcher while the game owns the foreground, even when
-            // accessibility has not yet supplied an Activity name.
-            return if (activity == MAIN_ACTIVITY) GameLaunchDecision.ALREADY_FOREGROUND
-            else GameLaunchDecision.BLOCKED
+            return GameLaunchDecision.ALREADY_FOREGROUND
         }
         return GameLaunchDecision.LAUNCH_GAME
     }

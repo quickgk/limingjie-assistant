@@ -14,6 +14,7 @@ import com.landosol.toolbox.labyrinth.vision.LabyrinthEntryPageState
 import com.landosol.toolbox.labyrinth.vision.ReferenceFitMapper
 import com.landosol.toolbox.labyrinth.vision.labyrinthRoleRewardOwnsInitialSelection
 import com.landosol.toolbox.labyrinth.node.LabyrinthNodeTypes
+import com.landosol.toolbox.labyrinth.node.NodeSessionState
 
 /** Exactly one page owns page-local actions, plans and overlay boxes for each recognized frame. */
 internal enum class LabyrinthPageUiOwner {
@@ -450,12 +451,21 @@ internal fun labyrinthResumedRunRewardPageOwnsRoute(
     else -> false
 }
 
+/** Creating a route session on the first map glimpse does not prove opening selection is done. */
+internal fun labyrinthRouteHasPassedOpening(
+    state: NodeSessionState?,
+    // A dispatched node move is already beyond opening, even before its destination confirms
+    // the persisted cursor. This also protects a picker opened by the very first event node.
+    hasNodeTransition: Boolean = false,
+): Boolean = hasNodeTransition ||
+    (state != null && (state.currentArea > 1 || state.visitedNodes.size > 1))
+
 /** A real opening roster must reclaim the entry flow even after a premature map handoff. */
 internal fun labyrinthShouldResumeOpeningSelection(
     entryPhaseComplete: Boolean,
     result: LabyrinthEntryFrameResult,
     /**
-     * Whether a route is already being executed. The opening selector, a shop 选择印记 pick and an
+     * Whether the route has progressed beyond the first area's start. The opening selector, a shop 选择印记 pick and an
      * event free pick are the *same* page with the same header, so the header alone cannot tell
      * them apart -- and only the first of the three belongs to the entry planner.
      *
