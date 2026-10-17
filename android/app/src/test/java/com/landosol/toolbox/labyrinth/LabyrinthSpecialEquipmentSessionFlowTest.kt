@@ -481,6 +481,10 @@ class LabyrinthSpecialEquipmentSessionFlowTest {
             } else {
                 postEntryFrame(session, frame, now)
             }
+            if (index == 0) {
+                // UNKNOWN 不算离开：第一帧之后本轮标记必须原样保留（帧的归属权不在本流程）。
+                assertEquals(LabyrinthSpecialEquipmentFlowStage.AWAIT_MAIN_DIALOG, flowStage(session))
+            }
             if (stoppedAtFrame < 0 && awaitStopped(session, timeoutMillis = 100L)) {
                 // 停机是走动作协程的（`finishFromPlanner` → `launchGuardedAction`），STOPPED 状态要等
                 // 协程在别的线程上落定。这里每帧最多等 100ms（已停机时立即返回），量到的才是「这些帧把
@@ -489,12 +493,13 @@ class LabyrinthSpecialEquipmentSessionFlowTest {
             }
         }
         assertEquals("the flow must not hold UNKNOWN frames", 0, held)
-        // 标记仍然保留：UNKNOWN 不算离开，但帧的归属权不在本流程。
-        assertEquals(LabyrinthSpecialEquipmentFlowStage.AWAIT_MAIN_DIALOG, flowStage(session))
         // 有界：喂帧过程中就已经停机（不是被本流程无限占住），而且停机点是有限的。
         assertTrue("the run must stop within the fed frames", stoppedAtFrame in 0 until 200)
         assertTrue("status=${session.state.value.status}", awaitStopped(session))
         assertTrue(session.state.value.message.orEmpty().isNotBlank())
+        // 停机是会话边界：stop() 走 `resetNodeExecutionState()`，本轮标记与普通编组记忆一起被清掉。
+        // 「UNKNOWN 不算离开」是本流程内部的判定，边界重置不属于它。
+        assertEquals(LabyrinthSpecialEquipmentFlowStage.INACTIVE, flowStage(session))
     }
 
     @Test

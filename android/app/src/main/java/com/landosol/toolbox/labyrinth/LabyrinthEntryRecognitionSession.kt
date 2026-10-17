@@ -1329,6 +1329,8 @@ class LabyrinthEntryRecognitionSession(
      *
      * 决策只在「超限的那一帧」带 tap，而 stage 那时已经推进到 DONE，后续帧的 DONE 决策不再带 tap；
      * 没有这个待办字段，逃生点击会被动作间隔或帧序吞掉：表现为「只被决定、从未点击」。
+     * 待办本身也有窗口（[specialEquipmentEscapeDeadline]）：窗口内始终派发不出去就放弃这次点击，
+     * 由「本轮已结束但弹窗仍开着」的分支停机并保留诊断。
      */
     @Volatile
     private var specialEquipmentPendingEscape: LabyrinthSpecialEquipmentTap? = null
@@ -4142,9 +4144,17 @@ class LabyrinthEntryRecognitionSession(
      * 画面已经离开编组页（或换了 Boss 页签）⇒ 上一次编组页动作被游戏收下了。
      *
      * 撤掉「没被收下」的记账并清零连续失败计数，让后面的动作重新从零开始。
+     *
+     * 「进度」的判据是**编组页签名变了**（页面类型 + Boss 队伍页签），不是「页面类型变了」：
+     * Boss 切队成功后页面类型仍然是编组页，只有页签变——只看页面类型会把一次成功的切队当成「点了
+     * 没反应」，pending 与连续失败计数就会带到下一队去。签名没变的编组页帧什么都不能清（那正是
+     * 「派发了但画面没动」的本体），没有 pending 时也不能清（刚被判未确认的那一次要留住计数）。
      */
     private fun acknowledgeBattleTeamActionProgress(result: LabyrinthEntryFrameResult) {
-        if (result.observation.state == LabyrinthEntryPageState.BATTLE_TEAM_SELECTION) return
+        if (result.observation.state == LabyrinthEntryPageState.BATTLE_TEAM_SELECTION) {
+            val pending = pendingBattleTeamAction
+            if (pending == null || battleTeamEditorSignature(result) == pending.signature) return
+        }
         pendingBattleTeamAction = null
         battleTeamActionUnconfirmedAttempts = 0
     }
@@ -6153,6 +6163,15 @@ class LabyrinthEntryRecognitionSession(
         LabyrinthSpecialEquipmentTap.CANCEL -> "特别装备：点击「取消」"
     }
 
+    /** 决策里的一次点击按按钮称呼（不含动作前缀，用来拼「等待后补发…」这类诊断消息）。 */
+    private fun specialEquipmentTapName(tap: LabyrinthSpecialEquipmentTap): String = when (tap) {
+        LabyrinthSpecialEquipmentTap.ENTRY -> "入口「特别装备」"
+        LabyrinthSpecialEquipmentTap.AUTO_BUTTON -> "「自动装备」"
+        LabyrinthSpecialEquipmentTap.AUTO_CONFIRM -> "弹窗2「确认」"
+        LabyrinthSpecialEquipmentTap.EQUIP_CONFIRM -> "「装备确定」"
+        LabyrinthSpecialEquipmentTap.CANCEL -> "「取消」"
+    }
+
     /**
      * 「特别装备」本轮的执行钩子。返回 true 表示这一帧由本流程接管（已派发点击或正在等待），调用处
      * 必须立刻 return，**不得**再产出任何编组执行步——三条开始战斗路径都由这一点统一切断。
@@ -6280,17 +6299,12 @@ class LabyrinthEntryRecognitionSession(
             },
             equipConfirmEnabled = equipEvidence.confirmedEnabled,
         )
-        if (decision.stage != specialEquipmentFlowStage) {
-            specialEquipmentStepAttempts = 0
-            specialEquipmentStepStartedAt = timestampMillis
-        }
-        specialEquipmentFlowStage = decision.stage
         // 只在本轮真正（武装后）看到过弹窗的帧上记账：用户手动打开的弹窗不引入任何新等待。
         if (dialogOpen) specialEquipmentDialogObserved = true
 
         // 结束但**带点击**的决策只有一种：超限逃生（点弹窗1 左下白色「取消」退回编组页）。
-        // 决策只在超限那一帧带 tap，而 stage 此刻已推进到 DONE ⇒ 必须把它记成待办，否则动作间隔或
-        // 下一帧的 DONE 决策会把它吞掉——这正是「只被决定、从未点击」的成因。
+        // 结束判定必须先落下（stage=DONE），否则下一帧的 DONE 决策不会再带上这次点击；点击本身记成
+        // 待办，等动作间隔到期补发——这是「记成待办再补发」的那一支，与下面「派发成功再提交」互补。
         if (decision.finished) {
             if (decision.abandoned) {
                 // 超限/放弃的**诊断原文**：后续帧不得用「本轮已结束，继续编组与开战」把它覆盖，
@@ -6300,38 +6314,56 @@ class LabyrinthEntryRecognitionSession(
             }
             if (decision.tap != null) {
                 specialEquipmentPendingEscape = decision.tap
+                // 待办本身也有窗口：窗口内始终派发不出去（例如单动作锁一直被占）就放弃这次点击，
+                // 交给下面「本轮已结束但弹窗仍开着」的分支停机并保留诊断，不引入无界等待。
+                specialEquipmentEscapeDeadline =
+                    timestampMillis + SPECIAL_EQUIPMENT_ESCAPE_TIMEOUT_MILLIS
             }
+        }
+        if (
+            specialEquipmentPendingEscape != null &&
+            specialEquipmentEscapeDeadline != Long.MIN_VALUE &&
+            timestampMillis >= specialEquipmentEscapeDeadline
+        ) {
+            specialEquipmentPendingEscape = null
         }
 
         val tap = decision.tap ?: specialEquipmentPendingEscape
         val rect = tap?.let { current -> observation?.let { labyrinthSpecialEquipmentTapRect(current, it) } }
-        // 1) 有按钮身份、矩形可信、动作间隔已到 ⇒ 派发（**先派发、再判结束**）。
-        if (rect != null && sessionActionIntervalElapsed(timestampMillis)) {
-            publishSpecialEquipmentMessage(decision.message)
-            if (
-                dispatchSpecialEquipmentAction(
-                    sessionId = sessionId,
-                    rect = rect,
-                    label = specialEquipmentTapLabel(requireNotNull(tap)),
-                    timestampMillis = timestampMillis,
-                )
-            ) {
-                if (decision.tap != null) {
-                    specialEquipmentStepAttempts++
-                }
-            }
-            if (decision.finished) {
-                // 逃生点击**只点一次**——派发后立刻清待办，否则下一个动作间隔（≥1.2s）到来时
-                // 残留的 pendingEscape 会再点一次「取消」，与本段的语义和注释都不符。
-                specialEquipmentPendingEscape = null
-                specialEquipmentEscapeDeadline =
-                    timestampMillis + SPECIAL_EQUIPMENT_ESCAPE_TIMEOUT_MILLIS
-            }
+        val tapReady = rect != null && sessionActionIntervalElapsed(timestampMillis)
+        // **「决定要点击」不等于「点击已经派发」**：会话动作间隔（[BATTLE_TEAM_ACTION_INTERVAL_MILLIS]）
+        // 与单动作锁都可能把这一下挡在派发之前。此时若把 stage 推进到下一状态，就等于宣布「已经点过
+        // 了」——下一帧的决策会从下一状态继续等一个永远不会出现的画面，入口与「装备确定」都是这样丢的。
+        // 所以 stage 只在「本帧没有待派发的点击」或「待派发的点击确实派发成功」之后才提交；被挡下的
+        // 这一帧保持原 stage、步进次数与步进起点不变，间隔到期后同一决策会重新算出来补发**一次**。
+        // 补发同样受 [MAX_SPECIAL_EQUIPMENT_STEP_ATTEMPTS] 与 [SPECIAL_EQUIPMENT_STEP_TIMEOUT_MILLIS]
+        // 约束（次数只在真的派发时增加，超时按原来的步进起点计时），因此不会变成新的无界等待。
+        if (tap == null || decision.finished) {
+            commitSpecialEquipmentStage(decision, timestampMillis)
+        }
+        // 1) 有待派发的点击，但这一帧派不出去（动作间隔未到 / 矩形不可信）⇒ 只等，stage 不动
+        //    （结束决策的 DONE 与逃生待办已经落下了）。间隔到期后同一决策会再算出来补发。
+        if (tap != null && !tapReady) {
+            publishSpecialEquipmentMessage(
+                when {
+                    // 矩形可信 ⇒ 唯一的拦路者就是会话动作间隔。
+                    rect != null -> "特别装备：动作间隔未到，等待后补发点击${specialEquipmentTapName(tap)}"
+                    // 结束决策的待办在等矩形：诊断原文优先，别用「本轮已结束，继续编组与开战」盖掉超限原因。
+                    decision.finished -> specialEquipmentDiagnostic ?: decision.message
+                    else -> decision.message
+                },
+            )
             return true
         }
 
-        // 2) 本轮已结束。
-        if (decision.finished) {
+        // 2) 没有待派发的点击。
+        if (tap == null) {
+            if (!decision.finished) {
+                // 3) 本轮还没结束：没有可信矩形就只等（不点候选位置）；
+                //    次数与时间上限都在决策函数里兜底。
+                publishSpecialEquipmentMessage(decision.message)
+                return true
+            }
             if (!dialogOpen) {
                 // 编组页干净：把这一帧交还既有编组/开战路径（放行开战）。
                 // 交还帧时把逃生窗口一并收掉，否则 pendingEscape/escapeDeadline 会跨轮残留，
@@ -6347,20 +6379,16 @@ class LabyrinthEntryRecognitionSession(
                 }
                 return false
             }
-            // 本轮已结束、弹窗却仍开着，而且没有可以派发的逃生点击。再吃帧就变成「安静地永久停在
-            // 编组页」：既逃不出弹窗也不停机、也没有「卡在哪一步」的诊断。
+            // 本轮已结束、弹窗却仍开着，而且没有可以派发的逃生点击（待办已清或矩形不可信）。再吃帧就
+            // 变成「安静地永久停在编组页」：既逃不出弹窗也不停机、也没有「卡在哪一步」的诊断。
             // 停机时必须保留超限诊断原文，不得用「本轮已结束，继续编组与开战」把它盖掉。
             val diagnostic = specialEquipmentDiagnostic ?: decision.message
             publishSpecialEquipmentMessage(diagnostic)
-            if (rect != null) {
-                // 还有待派发的逃生点击，只是被动作间隔挡着：等间隔过去再点，不停机。
-                return true
-            }
             if (
                 specialEquipmentEscapeDeadline != Long.MIN_VALUE &&
                 timestampMillis < specialEquipmentEscapeDeadline
             ) {
-                // 逃生点击已经派发出去，给它一个关闭窗口；窗口内不重复点击、也不停机。
+                // 逃生点击已经派发出去，给它一个等弹窗关闭的窗口；窗口内不重复点击、也不停机。
                 return true
             }
             finishFromPlanner(
@@ -6375,10 +6403,54 @@ class LabyrinthEntryRecognitionSession(
             return true
         }
 
-        // 3) 本轮还没结束：没有可信矩形就只等（不点候选位置），有矩形但间隔未到也等；
-        //    次数与时间上限都在决策函数里兜底。
-        publishSpecialEquipmentMessage(decision.message)
+        // 4) 有待派发的点击，而且这一帧满足派发条件 ⇒ **真的派发出去之后再提交 stage**。
+        publishSpecialEquipmentMessage(
+            if (decision.finished) specialEquipmentDiagnostic ?: decision.message else decision.message,
+        )
+        if (
+            !dispatchSpecialEquipmentAction(
+                sessionId = sessionId,
+                rect = requireNotNull(rect),
+                label = specialEquipmentTapLabel(tap),
+                timestampMillis = timestampMillis,
+            )
+        ) {
+            // 单动作锁被占：这一下没有落到画面上，与「动作间隔未到」同等处理——stage 不前进（结束决策
+            // 除外，它的 DONE 与逃生待办在前面的结束判定里已经落下），待办保留，下一次间隔到期后补发。
+            return true
+        }
+        if (!decision.finished) {
+            commitSpecialEquipmentStage(decision, timestampMillis)
+        }
+        if (decision.tap != null) {
+            specialEquipmentStepAttempts++
+        }
+        if (decision.finished) {
+            // 逃生点击**只点一次**——派发成功后立刻清待办，否则下一个动作间隔（≥1.2s）到来时残留的
+            // pendingEscape 会再点一次「取消」，与本段的语义和注释都不符。
+            specialEquipmentPendingEscape = null
+            specialEquipmentEscapeDeadline =
+                timestampMillis + SPECIAL_EQUIPMENT_ESCAPE_TIMEOUT_MILLIS
+        }
         return true
+    }
+
+    /**
+     * 提交决策给出的 stage（stage 变化时同时把步进次数与步进起点重置到本帧）。
+     *
+     * 只允许在「本帧没有待派发的点击」或「待派发的点击确实派发成功」之后调用：stage 的推进本身就
+     * 声明了「这一步的动作已经派发过」，在点击被会话节流或单动作锁挡下时提交它，会让下一帧的决策
+     * 从一个没人执行过的状态继续等下去。
+     */
+    private fun commitSpecialEquipmentStage(
+        decision: LabyrinthSpecialEquipmentDecision,
+        timestampMillis: Long,
+    ) {
+        if (decision.stage != specialEquipmentFlowStage) {
+            specialEquipmentStepAttempts = 0
+            specialEquipmentStepStartedAt = timestampMillis
+        }
+        specialEquipmentFlowStage = decision.stage
     }
 
     /**
@@ -6991,6 +7063,12 @@ class LabyrinthEntryRecognitionSession(
         lastBattleTeamRecommendationKey = null
         lastBattleTeamSelectionPlanLog = null
         resetBattleTeamExecutionTracking()
+        // 会话/账号边界：特别装备轮次与「上一场普通战斗的编组记忆」都属于**这一次运行**的状态。
+        // 应用复用同一个会话对象跑下一个账号，不能把上一轮的 stage（可能正停在 DONE，于是新账号的
+        // 第一场直接跳过穿戴）、旧轮次的超时起点、或上一场的普通编组记忆带过去。
+        // 这条重置只在 start()/stop() 走这里，普通战斗之间不会触发，所以「编组未变则跳过」照常生效。
+        resetSpecialEquipmentRound()
+        lastNormalBattleTeamSignature = null
         pendingBattleTeamAction = null
         battleTeamActionUnconfirmedAttempts = 0
         battleTeamActionStopReason = null
