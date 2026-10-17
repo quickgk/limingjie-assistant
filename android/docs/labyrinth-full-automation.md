@@ -1101,6 +1101,7 @@ batch=20260916-001 goal=gourmet run=008 stage=RETURNING_TO_TITLE
   - **验证与边界**：新增 `LabyrinthSpecialEquipmentSettingsTest`、`LabyrinthSpecialEquipmentRecognitionTest`、`LabyrinthSpecialEquipmentSessionFlowTest`、`LabyrinthBattleTeamActionRecoveryTest`、`LabyrinthSpecialEquipmentDispatchThrottleTest`、`LabyrinthSessionBoundaryResetTest`、`LabyrinthBossTeamSwitchProgressTest` 共 74 例；全量 `:app:testDebugUnitTest --rerun-tasks` = 158 套件 / 1176 用例 / 0 失败 / 0 错误 / 43 跳过，`:app:assembleDebug` 通过；`LabyrinthBattleTeamSelectionPlan.kt` 一行未改，`dispatchBattleTeamAction` 与 `resetBattleTeamExecutionTracking` 与 HEAD 逐行 0 差异。边界：无真机端到端回放；几何只标定 1920×1080（未标定尺寸下弹窗识别不出，属安全方向）；入口几何以基准图 `team-homare-eriko-20261002.png` 为准，底行几何不一致的帧走零点击路径；`20261007` 的 8 张截图与本机像素标定记录都不入库（本机 `.git/info/exclude`），仓库内只有裁出的 8 张控件小图与其 sha256。
 
 ---
+- [x] **编队/选角页布局测量的跨帧复用**（2026-10-17）。`findSecondaryRowTop()` 每帧扫 350..820 共 471 行，现由 `findSecondaryRowTopCached()` 按「同一 `RosterLayoutProfile` + 滚动条位置同一分档（32 档）+ ≤12 帧」复用；`gridDetector.detect()` 每帧全页重检，现由 `reusableGridSlots()` 按「同一 profile + 行提示 hash + 卡内像素指纹 + ≤8 帧」复用，指纹连续 2 次不符即回退真实检测（选中卡片会变暗但不移动卡框，故允许两次）。两处未命中都返回原路径；V5 的结果只喂兜底行，检测有结果时以检测为准。该测量开局选人页共用，缓存按 profile 实例区分；
 
 ## 20. 最终架构图
 
