@@ -837,6 +837,14 @@ internal const val SPECIAL_EQUIPMENT_STEP_TIMEOUT_MILLIS = 8_000L
  */
 internal const val SPECIAL_EQUIPMENT_EQUIP_EVIDENCE_STABLE_FRAMES = 2
 
+/**
+ * 「装备确定」两态判定的**最小时长**：自本轮当前步开始算起必须已经观察这么久。
+ *
+ * 帧数不等于固定时长：同样两帧，600 ms/帧时约 1.2 s，300 ms/帧时只有 0.6 s，低帧率下过渡帧
+ * 还能跨两帧；反过来只按时间门，在高帧率下又会退化成单帧放行。所以两者必须同时成立。
+ */
+internal const val SPECIAL_EQUIPMENT_EQUIP_EVIDENCE_STABLE_MILLIS = 1_000L
+
 /** 一帧上「装备确定」可点击性的原始证据分类（`null` 观测＝证据不足或两信号矛盾）。 */
 internal enum class LabyrinthSpecialEquipmentEquipEvidence {
     ENABLED,
@@ -848,8 +856,9 @@ internal enum class LabyrinthSpecialEquipmentEquipEvidence {
  * 连续同类证据的追踪状态。会话每帧调用一次 [labyrinthSpecialEquipmentEquipEvidenceStreak] 更新它。
  *
  * [confirmedEnabled] 是**唯一**可以拿去判态的结论：连续 [SPECIAL_EQUIPMENT_EQUIP_EVIDENCE_STABLE_FRAMES]
- * 帧同类证据之后才给 `true`/`false`，否则为 `null`（＝这一帧不下结论，见 [labyrinthSpecialEquipmentDecision]
- * 的 `equipConfirmEnabled` 参数）。「两信号矛盾」连续两帧按**不可点击**处理（保守分支）。
+ * 帧同类证据**且**已观察满 [SPECIAL_EQUIPMENT_EQUIP_EVIDENCE_STABLE_MILLIS] 之后才给 `true`/`false`，
+ * 否则为 `null`（＝这一帧不下结论，见 [labyrinthSpecialEquipmentDecision] 的 `equipConfirmEnabled`
+ * 参数）。「两信号矛盾」连续两帧按**不可点击**处理（保守分支）。
  */
 internal data class LabyrinthSpecialEquipmentEquipEvidenceStreak(
     val evidence: LabyrinthSpecialEquipmentEquipEvidence = LabyrinthSpecialEquipmentEquipEvidence.UNKNOWN,
@@ -862,12 +871,17 @@ internal data class LabyrinthSpecialEquipmentEquipEvidenceStreak(
  *
  * 只看弹窗1（[LabyrinthSpecialEquipmentStage.MAIN_DIALOG]）：弹窗2 打开或无弹窗时证据清零——要求
  * 点「确认」回到弹窗1 之后**重新判定**，所以回到弹窗1 的第一帧一定是 `frames = 1`、`confirmedEnabled = null`。
+ *
+ * [elapsedMillis] 是「自本轮当前步开始已经过了多久」，由调用方用同一时间戳算好传进来；两态结论要求
+ * 它不短于 [requiredMillis]。帧数与时长必须同时满足：帧数挡过渡帧，时长把帧率变化隔离掉。
  */
 internal fun labyrinthSpecialEquipmentEquipEvidenceStreak(
     previous: LabyrinthSpecialEquipmentEquipEvidenceStreak =
         LabyrinthSpecialEquipmentEquipEvidenceStreak(),
     observation: LabyrinthSpecialEquipmentObservation?,
+    elapsedMillis: Long,
     requiredFrames: Int = SPECIAL_EQUIPMENT_EQUIP_EVIDENCE_STABLE_FRAMES,
+    requiredMillis: Long = SPECIAL_EQUIPMENT_EQUIP_EVIDENCE_STABLE_MILLIS,
 ): LabyrinthSpecialEquipmentEquipEvidenceStreak {
     if (observation?.stage != LabyrinthSpecialEquipmentStage.MAIN_DIALOG) {
         return LabyrinthSpecialEquipmentEquipEvidenceStreak()
@@ -881,8 +895,8 @@ internal fun labyrinthSpecialEquipmentEquipEvidenceStreak(
     return LabyrinthSpecialEquipmentEquipEvidenceStreak(
         evidence = evidence,
         frames = frames,
-        // 只有连续同类证据达标才下结论；矛盾的连续两帧按不可点击。
-        confirmedEnabled = if (frames >= requiredFrames) {
+        // 只有连续同类证据**且**观察时间够长才下结论；矛盾的连续两帧按不可点击。
+        confirmedEnabled = if (frames >= requiredFrames && elapsedMillis >= requiredMillis) {
             evidence == LabyrinthSpecialEquipmentEquipEvidence.ENABLED
         } else {
             null

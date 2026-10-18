@@ -30,7 +30,7 @@ import org.junit.Test
  * 「特别装备」点击与会话节流/单动作锁的关系：**被挡下的点击不得算作已点击**。
  *
  * 不变量：决策里带 `tap` 只表示「这一刻该点哪个按钮」，`specialEquipmentFlowStage` 的推进表示
- * 「这一步的动作已经派发过」。会话动作间隔（`BATTLE_TEAM_ACTION_INTERVAL_MILLIS = 1200`）与单动作锁
+ * 「这一步的动作已经派发过」。会话动作间隔（`BATTLE_TEAM_ACTION_INTERVAL_MILLIS`）与单动作锁
  * 都会把派发挡在 `dispatchSpecialEquipmentAction` 之前，此时若提交 stage，下一帧的决策就会从下一个
  * 状态继续等一个永远不会出现的画面（入口、「自动装备」、弹窗2「确认」、「装备确定」都是这样丢的）。
  * 所以 stage 只在「本帧没有待派发的点击」或「待派发的点击确实派发成功」之后才前进；被挡下的帧保持
@@ -52,6 +52,16 @@ class LabyrinthSpecialEquipmentDispatchThrottleTest {
     /** 推荐阵容、编组计划与画面上当前队伍三者一致的五人队伍。 */
     private val teamIds = listOf("r0", "r1", "r2", "r3", "r4")
 
+    /**
+     * 节流用例的公共时间轴，全部由生产常量推导，改间隔时不用跟着改数字。
+     *
+     * [lastClick] 是上一次会话点击；[insideInterval] 是「仍在间隔之内」的那一帧；
+     * [pastInterval] 是「刚过间隔」的那一帧。
+     */
+    private val lastClick = 1_000L
+    private val insideInterval = lastClick + BATTLE_TEAM_ACTION_INTERVAL_MILLIS - 200L
+    private val pastInterval = lastClick + BATTLE_TEAM_ACTION_INTERVAL_MILLIS + 100L
+
     /** 一个「决策要求点击、但动作间隔还没到」的现场。 */
     private data class ThrottledTapCase(
         val stage: LabyrinthSpecialEquipmentFlowStage,
@@ -65,11 +75,11 @@ class LabyrinthSpecialEquipmentDispatchThrottleTest {
     @Test
     fun `an entry tap blocked by the session interval is not counted as clicked and is dispatched once past it`() {
         val session = session(LabyrinthCombatKind.NORMAL, settingsFor(LabyrinthCombatKind.NORMAL))
-        // 上一次会话点击在 1000：编组页这一帧只差 600ms，入口点击会被会话节流挡下。
-        setLastSessionActionAt(session, 1_000L)
+        // 上一次会话点击就在 lastClick：编组页这一帧仍在间隔之内，入口点击会被会话节流挡下。
+        setLastSessionActionAt(session, lastClick)
 
-        // t=1600：决策要求点入口，但动作间隔未到 ⇒ 不派发，而且 stage 必须停在 AWAIT_ENTRY。
-        assertTrue(flowFrame(session, teamFrame(teamPageObservation()), 1_600L))
+        // 间隔之内：决策要求点入口，但动作间隔未到 ⇒ 不派发，而且 stage 必须停在 AWAIT_ENTRY。
+        assertTrue(flowFrame(session, teamFrame(teamPageObservation()), insideInterval))
         assertNull("a throttled tap must not be dispatched", frameActionLabel(session))
         assertEquals(
             "entering AWAIT_MAIN_DIALOG without ever clicking is the defect this pins",
@@ -77,26 +87,26 @@ class LabyrinthSpecialEquipmentDispatchThrottleTest {
             flowStage(session),
         )
         assertEquals(0, stepAttempts(session))
-        assertEquals("no click ⇒ the shared throttle stamp must not move", 1_000L, lastSessionActionAt(session))
+        assertEquals("no click ⇒ the shared throttle stamp must not move", lastClick, lastSessionActionAt(session))
         assertTrue(
             "message=${session.state.value.message}",
             session.state.value.message.orEmpty().contains("等待后补发"),
         )
 
-        // t=2300：间隔到期（1300ms ≥ 1200）⇒ 同一条决策补发，动作正是入口点击。
-        assertTrue(flowFrame(session, teamFrame(teamPageObservation()), 2_300L))
+        // 间隔到期 ⇒ 同一条决策补发，动作正是入口点击。
+        assertTrue(flowFrame(session, teamFrame(teamPageObservation()), pastInterval))
         assertEquals("特别装备：点击入口「特别装备」", frameActionLabel(session))
         assertEquals(LabyrinthSpecialEquipmentFlowStage.AWAIT_MAIN_DIALOG, flowStage(session))
         assertEquals(1, stepAttempts(session))
-        assertEquals(2_300L, lastSessionActionAt(session))
+        assertEquals(pastInterval, lastSessionActionAt(session))
 
         // 补发**只补一次**：下一帧不得再点同一个入口（stage 已经前进了）。
         releaseActionLatch(session)
-        assertTrue(flowFrame(session, teamFrame(teamPageObservation()), 2_400L))
+        assertTrue(flowFrame(session, teamFrame(teamPageObservation()), pastInterval + 100L))
         assertNull("the entry must not be re-clicked after it was dispatched", frameActionLabel(session))
         assertEquals(LabyrinthSpecialEquipmentFlowStage.AWAIT_MAIN_DIALOG, flowStage(session))
         assertEquals(1, stepAttempts(session))
-        assertEquals(2_300L, lastSessionActionAt(session))
+        assertEquals(pastInterval, lastSessionActionAt(session))
     }
 
     @Test
@@ -142,11 +152,11 @@ class LabyrinthSpecialEquipmentDispatchThrottleTest {
         for (case in cases) {
             val session = session(LabyrinthCombatKind.NORMAL, settingsFor(LabyrinthCombatKind.NORMAL))
             setFlowStage(session, case.stage)
-            setField(session, "specialEquipmentStepStartedAt", 1_000L)
-            setLastSessionActionAt(session, 1_000L)
+            setField(session, "specialEquipmentStepStartedAt", lastClick)
+            setLastSessionActionAt(session, lastClick)
 
-            // t=1600：决策要求点击，但动作间隔未到 ⇒ 不派发、stage 不动。
-            assertTrue(flowFrame(session, teamFrame(case.observation), 1_600L))
+            // 间隔之内：决策要求点击，但动作间隔未到 ⇒ 不派发、stage 不动。
+            assertTrue(flowFrame(session, teamFrame(case.observation), insideInterval))
             assertNull("${case.stage} must not dispatch while throttled", frameActionLabel(session))
             assertEquals("${case.stage} must not advance without a click", case.stage, flowStage(session))
             assertEquals(0, stepAttempts(session))
@@ -155,12 +165,12 @@ class LabyrinthSpecialEquipmentDispatchThrottleTest {
                 session.state.value.message.orEmpty().contains("等待后补发"),
             )
 
-            // t=2300：间隔到期 ⇒ 补发同一个按钮的动作，只一次。
-            assertTrue(flowFrame(session, teamFrame(case.observation), 2_300L))
+            // 间隔到期 ⇒ 补发同一个按钮的动作，只一次。
+            assertTrue(flowFrame(session, teamFrame(case.observation), pastInterval))
             assertEquals(case.label, frameActionLabel(session))
             assertEquals(case.nextStage, flowStage(session))
             assertEquals(1, stepAttempts(session))
-            assertEquals(2_300L, lastSessionActionAt(session))
+            assertEquals(pastInterval, lastSessionActionAt(session))
         }
     }
 
@@ -170,17 +180,20 @@ class LabyrinthSpecialEquipmentDispatchThrottleTest {
     fun `an equip-confirm tap blocked by the session interval keeps the stage and is dispatched once past it`() {
         val session = session(LabyrinthCombatKind.NORMAL, settingsFor(LabyrinthCombatKind.NORMAL))
         setFlowStage(session, LabyrinthSpecialEquipmentFlowStage.AWAIT_SECOND_MAIN_DIALOG)
-        setField(session, "specialEquipmentStepStartedAt", 1_000L)
-        setLastSessionActionAt(session, 1_000L)
+        // 本步从 0 开始计时（两态判据还要求已观察满一秒），上一次点击在 lastClick。
+        setField(session, "specialEquipmentStepStartedAt", 0L)
+        setLastSessionActionAt(session, lastClick)
         val dialog = mainDialogObservation(enabled = true)
+        val firstEvidence = lastClick + 400L
+        val secondEvidence = lastClick + BATTLE_TEAM_ACTION_INTERVAL_MILLIS - 50L
 
-        // t=1500：第一帧只推进「连续两帧」证据，本来就不下结论。
-        assertTrue(flowFrame(session, teamFrame(dialog), 1_500L))
+        // 第一帧只推进「连续两帧」证据，本来就不下结论。
+        assertTrue(flowFrame(session, teamFrame(dialog), firstEvidence))
         assertNull(frameActionLabel(session))
         assertEquals(LabyrinthSpecialEquipmentFlowStage.AWAIT_SECOND_MAIN_DIALOG, flowStage(session))
 
-        // t=2000：第二帧证据已经稳定（要求点「装备确定」），但只差 200ms 到 1200ms 间隔 ⇒ 不派发。
-        assertTrue(flowFrame(session, teamFrame(dialog), 2_000L))
+        // 第二帧证据已经稳定（要求点「装备确定」），但仍在会话间隔之内 ⇒ 不派发。
+        assertTrue(flowFrame(session, teamFrame(dialog), secondEvidence))
         assertNull("the stable second frame is still throttled", frameActionLabel(session))
         assertEquals(
             "AWAIT_ACK_EQUIP without ever clicking 装备确定 is the defect this pins",
@@ -193,18 +206,24 @@ class LabyrinthSpecialEquipmentDispatchThrottleTest {
             session.state.value.message.orEmpty().contains("等待后补发"),
         )
 
-        // t=2500：间隔到期 ⇒ 补发「装备确定」，只一次。
-        assertTrue(flowFrame(session, teamFrame(dialog), 2_500L))
+        // 间隔到期 ⇒ 补发「装备确定」，只一次。
+        assertTrue(flowFrame(session, teamFrame(dialog), pastInterval))
         assertEquals("特别装备：点击「装备确定」", frameActionLabel(session))
         assertEquals(LabyrinthSpecialEquipmentFlowStage.AWAIT_ACK_EQUIP, flowStage(session))
         assertEquals(1, stepAttempts(session))
-        assertEquals(2_500L, lastSessionActionAt(session))
+        assertEquals(pastInterval, lastSessionActionAt(session))
 
         releaseActionLatch(session)
-        assertTrue(flowFrame(session, teamFrame(dialog), 3_800L))
+        assertTrue(
+            flowFrame(
+                session,
+                teamFrame(dialog),
+                pastInterval + BATTLE_TEAM_ACTION_INTERVAL_MILLIS + 100L,
+            ),
+        )
         assertNull("装备确定 must not be re-dispatched while the popup stays open", frameActionLabel(session))
         assertEquals(LabyrinthSpecialEquipmentFlowStage.AWAIT_ACK_EQUIP, flowStage(session))
-        assertEquals(2_500L, lastSessionActionAt(session))
+        assertEquals(pastInterval, lastSessionActionAt(session))
     }
 
     // ---- 超限逃生（点「取消」）：结束标记照落，点击记待办补发一次 ----
@@ -214,12 +233,12 @@ class LabyrinthSpecialEquipmentDispatchThrottleTest {
         val session = session(LabyrinthCombatKind.NORMAL, settingsFor(LabyrinthCombatKind.NORMAL))
         setFlowStage(session, LabyrinthSpecialEquipmentFlowStage.AWAIT_SECOND_MAIN_DIALOG)
         setField(session, "specialEquipmentStepAttempts", MAX_SPECIAL_EQUIPMENT_STEP_ATTEMPTS)
-        setLastSessionActionAt(session, 1_000L)
+        setLastSessionActionAt(session, lastClick)
         val dialog = mainDialogObservation(enabled = true)
 
-        // t=1600：超限决策要求点「取消」，但动作间隔未到 ⇒ 不派发；结束判定仍要落下，
+        // 间隔之内：超限决策要求点「取消」，但动作间隔未到 ⇒ 不派发；结束判定仍要落下，
         // 点击本身记成待办（否则下一帧的 DONE 决策不会再带上它）。
-        assertTrue(flowFrame(session, teamFrame(dialog), 1_600L))
+        assertTrue(flowFrame(session, teamFrame(dialog), insideInterval))
         assertNull("the escape tap must wait for the interval", frameActionLabel(session))
         assertEquals(LabyrinthSpecialEquipmentFlowStage.DONE, flowStage(session))
         assertEquals(LabyrinthSpecialEquipmentTap.CANCEL, pendingEscape(session))
@@ -228,17 +247,17 @@ class LabyrinthSpecialEquipmentDispatchThrottleTest {
             diagnosticOf(session).orEmpty().contains("超限"),
         )
 
-        // t=2300：间隔到期 ⇒ 待办里的「取消」真的点出去，只点这一次。
-        assertTrue(flowFrame(session, teamFrame(dialog), 2_300L))
+        // 间隔到期 ⇒ 待办里的「取消」真的点出去，只点这一次。
+        assertTrue(flowFrame(session, teamFrame(dialog), pastInterval))
         assertEquals("特别装备：点击「取消」", frameActionLabel(session))
         assertEquals(LabyrinthSpecialEquipmentFlowStage.DONE, flowStage(session))
         assertNull("the escape must be cleared once dispatched", pendingEscape(session))
-        assertEquals(2_300L, lastSessionActionAt(session))
+        assertEquals(pastInterval, lastSessionActionAt(session))
 
         // 同一弹窗仍在、间隔未到：不得重复点「取消」。
-        assertTrue(flowFrame(session, teamFrame(dialog), 2_600L))
+        assertTrue(flowFrame(session, teamFrame(dialog), pastInterval + 300L))
         assertNull("the escape must not be repeated", frameActionLabel(session))
-        assertEquals(2_300L, lastSessionActionAt(session))
+        assertEquals(pastInterval, lastSessionActionAt(session))
     }
 
     // ---- 被挡期间仍然有界：3 次 / 8s 两个既有上限照常收尾 ----

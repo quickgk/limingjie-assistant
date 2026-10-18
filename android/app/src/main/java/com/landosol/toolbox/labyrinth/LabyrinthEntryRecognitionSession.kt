@@ -449,6 +449,14 @@ internal const val ACTION_LATCH_STUCK_TIMEOUT_MILLIS = 60_000L
  */
 internal const val POST_ENTRY_STALL_TIMEOUT_MILLIS = 120_000L
 
+/**
+ * 编组页两次动作之间的点击防抖间隔，本会话内**任意**两次点击（特别装备流程与编组/开战共用）都受它约束。
+ *
+ * 取值 600 ms：识别节拍是 300 ms，600 ms 正好是一帧，不必再空等两帧；同时仍能把「弹窗关闭动画还没收完
+ * 就点下一处」这类插队挡在间隔之外。真正的兜底是动作被吞之后的回收重试，间隔只负责降低吞点击的概率。
+ */
+internal const val BATTLE_TEAM_ACTION_INTERVAL_MILLIS = 600L
+
 internal enum class LabyrinthEventFreeRoleBlockedAction { WAIT, STOP }
 
 /**
@@ -6312,11 +6320,18 @@ class LabyrinthEntryRecognitionSession(
         }
 
 // 两态判定必须先**跨帧稳定**：这一帧的原始证据只用来推进连续
-        // 计数：只有连续 SPECIAL_EQUIPMENT_EQUIP_EVIDENCE_STABLE_FRAMES 帧同类证据才把结论交给决策，
+        // 计数：只有连续 SPECIAL_EQUIPMENT_EQUIP_EVIDENCE_STABLE_FRAMES 帧同类证据、且自本步开始已观察满
+        // SPECIAL_EQUIPMENT_EQUIP_EVIDENCE_STABLE_MILLIS 才把结论交给决策（帧数挡过渡帧，时长把帧率变化隔离掉），
         // 首帧/过渡帧拿到的是 null ⇒ 决策只等一帧，既不点「装备确定」也不点「取消」。
+        val stepElapsedMillis = if (specialEquipmentStepStartedAt == Long.MIN_VALUE) {
+            0L
+        } else {
+            (timestampMillis - specialEquipmentStepStartedAt).coerceAtLeast(0L)
+        }
         val equipEvidence = labyrinthSpecialEquipmentEquipEvidenceStreak(
             previous = specialEquipmentEquipEvidence,
             observation = observation,
+            elapsedMillis = stepElapsedMillis,
         )
         specialEquipmentEquipEvidence = equipEvidence
 
@@ -6324,11 +6339,7 @@ class LabyrinthEntryRecognitionSession(
             stage = specialEquipmentFlowStage,
             observation = observation,
             stepAttempts = specialEquipmentStepAttempts,
-            stepElapsedMillis = if (specialEquipmentStepStartedAt == Long.MIN_VALUE) {
-                0L
-            } else {
-                (timestampMillis - specialEquipmentStepStartedAt).coerceAtLeast(0L)
-            },
+            stepElapsedMillis = stepElapsedMillis,
             equipConfirmEnabled = equipEvidence.confirmedEnabled,
         )
         // 只在本轮真正（武装后）看到过弹窗的帧上记账：用户手动打开的弹窗不引入任何新等待。
@@ -9551,12 +9562,6 @@ class LabyrinthEntryRecognitionSession(
         const val CHARACTER_ACQUISITION_ACTION_INTERVAL_MILLIS = 650L
         const val NODE_MAP_SETTLE_AFTER_POST_ACTION_MILLIS = 2_000L
         const val MAX_POST_ENTRY_ATTEMPTS = 6
-        // Click-spam guard between two battle-team actions. Halved from 1200 ms: at the 600 ms frame
-        // cadence 1200 ms forced a two-frame wait and, with the confirmation frame on top, made every
-        // team-editor action cost three frames (1.85 s). 600 ms is one frame at the 300 ms cadence.
-        // The guard's structure is untouched -- only the threshold moved -- and an on-device A/B
-        // decides whether the game still keeps up (the gesture cancel/reject counters must stay 0).
-        const val BATTLE_TEAM_ACTION_INTERVAL_MILLIS = 600L
         const val BATTLE_TEAM_CHARACTER_FEEDBACK_TIMEOUT_MILLIS = 4_000L
         /**
          * 「编组页动作派发后，画面还允许原地不动多久」。

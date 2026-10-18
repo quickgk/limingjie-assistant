@@ -230,40 +230,69 @@ class LabyrinthSpecialEquipmentSessionFlowTest {
     }
 
     @Test
-    fun `the equip evidence streak only confirms after two identical frames`() {
+    fun `the equip evidence streak needs both two identical frames and a full second`() {
         // 单帧（含过渡帧）一律不下结论。
         var streak = labyrinthSpecialEquipmentEquipEvidenceStreak(
             observation = mainDialogObservation(enabled = false),
+            elapsedMillis = 0L,
         )
         assertEquals(1, streak.frames)
         assertNull(streak.confirmedEnabled)
 
-        // 连续第二帧同类 ⇒ 才给出「不可点击」。
-        streak = labyrinthSpecialEquipmentEquipEvidenceStreak(streak, mainDialogObservation(enabled = false))
+        // 两帧同类但还没观察满一秒 ⇒ 仍然不下结论（帧数不等于时长）。
+        streak = labyrinthSpecialEquipmentEquipEvidenceStreak(
+            streak,
+            mainDialogObservation(enabled = false),
+            elapsedMillis = 600L,
+        )
         assertEquals(2, streak.frames)
+        assertNull(streak.confirmedEnabled)
+
+        // 满一秒后才把结论交给决策。
+        streak = labyrinthSpecialEquipmentEquipEvidenceStreak(
+            streak,
+            mainDialogObservation(enabled = false),
+            elapsedMillis = 1_000L,
+        )
+        assertEquals(3, streak.frames)
         assertEquals(false, streak.confirmedEnabled)
 
         // 弹窗2 / 无弹窗：证据清零（回到弹窗1 之后必须重判）。
-        streak = labyrinthSpecialEquipmentEquipEvidenceStreak(streak, autoDialogObservation())
+        streak = labyrinthSpecialEquipmentEquipEvidenceStreak(
+            streak,
+            autoDialogObservation(),
+            elapsedMillis = 2_000L,
+        )
         assertEquals(0, streak.frames)
         assertNull(streak.confirmedEnabled)
-        streak = labyrinthSpecialEquipmentEquipEvidenceStreak(streak, null)
+        streak = labyrinthSpecialEquipmentEquipEvidenceStreak(streak, null, elapsedMillis = 2_000L)
         assertEquals(0, streak.frames)
 
-        // 证据类别变化（过渡帧 → 可用）同样重新计数。
-        streak = labyrinthSpecialEquipmentEquipEvidenceStreak(streak, mainDialogObservation(enabled = true))
+        // 证据类别变化（过渡帧 → 可用）同样重新计数；此后时间门已满足，两帧同类即给结论。
+        streak = labyrinthSpecialEquipmentEquipEvidenceStreak(
+            streak,
+            mainDialogObservation(enabled = true),
+            elapsedMillis = 1_500L,
+        )
         assertEquals(1, streak.frames)
         assertNull(streak.confirmedEnabled)
-        streak = labyrinthSpecialEquipmentEquipEvidenceStreak(streak, mainDialogObservation(enabled = true))
+        streak = labyrinthSpecialEquipmentEquipEvidenceStreak(
+            streak,
+            mainDialogObservation(enabled = true),
+            elapsedMillis = 1_600L,
+        )
+        assertEquals(2, streak.frames)
         assertEquals(true, streak.confirmedEnabled)
 
         // 连续两帧两信号矛盾 ⇒ 按不可点击，而不是永远不下结论。
         var contradictory = labyrinthSpecialEquipmentEquipEvidenceStreak(
             observation = mainDialogObservation(enabled = null),
+            elapsedMillis = 0L,
         )
         contradictory = labyrinthSpecialEquipmentEquipEvidenceStreak(
             contradictory,
             mainDialogObservation(enabled = null),
+            elapsedMillis = 1_000L,
         )
         assertEquals(false, contradictory.confirmedEnabled)
     }
@@ -1678,6 +1707,9 @@ class LabyrinthSpecialEquipmentSessionFlowTest {
 
     private fun setFlowStage(session: Any, stage: LabyrinthSpecialEquipmentFlowStage) {
         setField(session, "specialEquipmentFlowStage", stage)
+        // 真实运行时「进入下一步」会同时盖下步进起点（两态判据的「已观察满一秒」从它算起）。
+        // 这里的用例把这一步视为在 t=0 开始，于是后续帧的时间戳就是已观察时长。
+        setField(session, "specialEquipmentStepStartedAt", 0L)
     }
 
     private fun stepAttempts(session: Any): Int = field(session, "specialEquipmentStepAttempts").get(session) as Int

@@ -47,10 +47,10 @@ class LabyrinthBattleTeamActionRecoveryTest {
 
     private val roleIds = (1..5).map { "r$it" }
 
-    // ---- 共享动作节流：0.76s 的「战斗开始」必须被挡住 ----
+    // ---- 共享动作节流：间隔之内的「战斗开始」必须被挡住 ----
 
     @Test
-    fun `the start tap 760ms after the equipment cancel is withheld and only fires past the shared interval`() =
+    fun `the start tap just inside the shared interval after the equipment cancel is withheld`() =
         runBlocking {
             withSession { session, _ ->
                 assertEquals(
@@ -72,11 +72,15 @@ class LabyrinthBattleTeamActionRecoveryTest {
                 awaitActions(session)
                 assertEquals(3_600L, lastSessionActionAt(session))
 
-                // 实机 0.76s 之后那一帧：编组页已经干净，开战路径就想点「战斗开始」。
+                // 间隔还没走完的那一帧：编组页已经干净，开战路径就想点「战斗开始」。
                 val cleanFrame = teamFrame()
                 assertNull(
-                    "760ms 间隔的开战点击就是被游戏吞掉的那一下，不得派发",
-                    feedFrame(session, cleanFrame, 3_600L + 760L),
+                    "间隔之内的开战点击就是被游戏吞掉的那一下，不得派发",
+                    feedFrame(
+                        session,
+                        cleanFrame,
+                        3_600L + BATTLE_TEAM_ACTION_INTERVAL_MILLIS - 440L,
+                    ),
                 )
                 // 没有点击 = 会话级节流戳没有前进（编组执行步本身在这一帧已经被选中，所以只能看点击）。
                 assertEquals(3_600L, lastSessionActionAt(session))
@@ -86,24 +90,32 @@ class LabyrinthBattleTeamActionRecoveryTest {
                     !modalCloseSettlePending(session),
                 )
 
-                // 距离「取消」1000ms：节流未到，仍然不得派发——这一条只可能是共享时间戳挡住的。
+                // 间隔之内：仍然不得派发——这一条只可能是共享时间戳挡住的。
                 assertNull(
-                    "1000ms 仍不足 1200ms，必须继续等",
-                    feedFrame(session, cleanFrame, 3_600L + 1_000L),
+                    "间隔未到，必须继续等",
+                    feedFrame(
+                        session,
+                        cleanFrame,
+                        3_600L + BATTLE_TEAM_ACTION_INTERVAL_MILLIS - 200L,
+                    ),
                 )
                 assertEquals(3_600L, lastSessionActionAt(session))
 
-                // 超过 1200ms：放行，且派发的正是同一条「战斗开始」。
+                // 超过间隔：放行，且派发的正是同一条「战斗开始」。
                 assertEquals(
                     "编组完成，开始战斗",
-                    feedFrame(session, cleanFrame, 3_600L + 1_300L),
+                    feedFrame(
+                        session,
+                        cleanFrame,
+                        3_600L + BATTLE_TEAM_ACTION_INTERVAL_MILLIS + 100L,
+                    ),
                 )
                 assertEquals("start:${roleIds.joinToString(",")}", lastExecutionKey(session))
                 awaitActions(session)
 
                 // 这一下如果也被游戏吞掉（画面一直停在编组页），本次提交必须被释放并允许重发——
                 // 与「特别装备关闭」的编组路径共用同一处回收。
-                var now = 3_600L + 1_300L
+                var now = 3_600L + BATTLE_TEAM_ACTION_INTERVAL_MILLIS + 100L
                 repeat(9) {
                     now += 600L
                     feedFrame(session, cleanFrame, now)
@@ -132,7 +144,7 @@ class LabyrinthBattleTeamActionRecoveryTest {
                 assertEquals("特别装备：点击「取消」", feedFrame(session, dialogFrame, 3_500L))
                 awaitActions(session)
 
-                // 弹窗刚关的这一帧距离点击已经 1400ms（> 1200ms）：唯一还挡着开战的就是「关闭后的第一帧
+                // 弹窗刚关的这一帧距离点击已经远超过间隔：唯一还挡着开战的就是「关闭后的第一帧
                 // 让给关闭动画」这条规则，所以这是能失败的真断言。
                 val cleanFrame = teamFrame()
                 assertNull(
@@ -438,8 +450,11 @@ class LabyrinthBattleTeamActionRecoveryTest {
 
     private fun set(target: Any?, name: String, value: Any?) = field(target, name).set(target, value)
 
-    private fun setFlowStage(session: Any, stage: LabyrinthSpecialEquipmentFlowStage) =
+    private fun setFlowStage(session: Any, stage: LabyrinthSpecialEquipmentFlowStage) {
         set(session, "specialEquipmentFlowStage", stage)
+        // 真实运行时「进入下一步」会同时盖下步进起点（两态判据的「已观察满一秒」从它算起）。
+        set(session, "specialEquipmentStepStartedAt", 0L)
+    }
 
     /**
      * 反射调用：按名字与参数个数找方法，并按目标形参类型适配（`AutomationSessionId` 是 value class，
