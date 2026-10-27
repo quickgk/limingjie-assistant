@@ -458,6 +458,10 @@ internal const val POST_ENTRY_STALL_TIMEOUT_MILLIS = 120_000L
  */
 internal const val BATTLE_TEAM_ACTION_INTERVAL_MILLIS = 600L
 
+/** 任意节点编号 → 它所属的区域（1~5）；万位不合法时返回 null。 */
+internal fun labyrinthNodeAreaOf(blockId: Long?): Int? =
+    blockId?.let { (it / 10_000).toInt().takeIf { area -> area in 1..5 } }
+
 internal enum class LabyrinthEventFreeRoleBlockedAction { WAIT, STOP }
 
 /**
@@ -1501,6 +1505,9 @@ class LabyrinthEntryRecognitionSession(
     private var plannedShopRefreshConfirmedAt = Long.MIN_VALUE
     @Volatile
     private var shopRelicPurchasesThisCycle = 0
+    /** 300-coin refills already paid for in the current shop node; cleared on every shop entry. */
+    @Volatile
+    private var shopRefreshesThisVisit = 0
     @Volatile
     private var pendingRelicSelection: LabyrinthRelicMatch? = null
     @Volatile
@@ -1898,6 +1905,7 @@ class LabyrinthEntryRecognitionSession(
         shopRelicPurchasesThisCycle = 0
         plannedShopPurchaseCounted = false
         shopRelicPurchasesThisCycle = 0
+        shopRefreshesThisVisit = 0
         pendingRelicSelection = null
         relicChoiceCommitted = false
         roleRewardChoiceCommitted = false
@@ -2532,6 +2540,15 @@ class LabyrinthEntryRecognitionSession(
             }
         }
         val persistedCurrentNode = labyrinthPersistedCurrentNode(validatedRoute)
+        // A resumed run can reopen straight on a shop page, where no node tap ever wrote the area.
+        // Fall back to the persisted node, and to the block-id prefix when the node carries no
+        // area, so an area-4 shop is never judged by a route progress that already flipped to the
+        // next area. Area 4 is the hard saving stop, and that decision must not depend on which
+        // path got here first.
+        if (activeNodeArea == null && persistedCurrentNode?.blockType == LabyrinthNodeTypes.SHOP) {
+            activeNodeType = LabyrinthNodeTypes.SHOP
+            activeNodeArea = persistedCurrentNode.area ?: labyrinthNodeAreaOf(persistedCurrentNode.blockId)
+        }
         val effectiveNodeType = activeNodeType ?: persistedCurrentNode?.blockType
         val eventFreeRoleSelection = labyrinthEventFreeRoleSelectionOwnsFrame(
             pageState = pageState,
@@ -4207,6 +4224,7 @@ class LabyrinthEntryRecognitionSession(
             lockedFocus = relicFocusMark,
             relicPurchasesInCycle = shopRelicPurchasesThisCycle,
             refreshAvailabilityKnown = refreshAnchorReady,
+            refreshesUsedInVisit = shopRefreshesThisVisit,
         )
     }
 
@@ -7166,6 +7184,7 @@ class LabyrinthEntryRecognitionSession(
                             // The refresh button opens a second confirmation dialog.  Keep the
                             // completed-cycle count until that dialog is confirmed and fresh shop
                             // stock is visible again.
+                            shopRefreshesThisVisit++
                             plannedShopRefreshStartedAt = clock()
                             plannedShopRefreshConfirmedAt = Long.MIN_VALUE
                             postEntryStableFrames = 0
@@ -7933,6 +7952,8 @@ class LabyrinthEntryRecognitionSession(
                         ?.nextNode
                         ?.takeIf { it.blockId == action.blockId }
                         ?.area
+                        // 区域号以节点编号为准：routeProgress 在区域边界会提前翻页，编号不会。
+                        ?: labyrinthNodeAreaOf(action.blockId)
                         ?: _state.value.routeProgress?.currentArea
                     prepareNodeTransitionContext(action.blockType, targetArea)
                     pendingNodeTransition = PendingNodeTransition(
@@ -8023,6 +8044,7 @@ class LabyrinthEntryRecognitionSession(
             // Reset only when entering a new shop node; purchase-animation page churn must not
             // erase this counter, but a recovered movement dialog represents a real new node.
             shopRelicPurchasesThisCycle = 0
+            shopRefreshesThisVisit = 0
             clearPlannedShopRefresh()
         }
         if (blockType == LabyrinthNodeTypes.BOSS) {

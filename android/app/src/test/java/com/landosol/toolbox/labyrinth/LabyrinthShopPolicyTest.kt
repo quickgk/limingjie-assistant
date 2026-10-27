@@ -197,18 +197,79 @@ class LabyrinthShopPolicyTest {
     }
 
     @Test
-    fun `depleted row follows every configured starting area including area four`() {
+    fun `depleted row follows every configured starting area except the area four saving stop`() {
         for (start in 1..5) {
             for (area in 1..5) {
                 val decision = LabyrinthShopPolicy(finalArea = start).decide(
                     area, disabledRow(), emptyList(), refreshAvailable = true,
                 )
-                assertEquals("start=$start area=$area: $decision", area >= start, decision is LabyrinthShopDecision.Refresh)
+                val expectRefresh = area != 4 && area >= start
+                assertEquals("start=$start area=$area: $decision", expectRefresh, decision is LabyrinthShopDecision.Refresh)
             }
         }
-        assertTrue(LabyrinthShopPolicy(finalArea = 4).decide(
-            4, listOf(item("relic", "会心", 1, true)), emptyList(), refreshAvailable = true,
-        ) is LabyrinthShopDecision.BuyRelic)
+        // Area 4 is a hard saving stop: no refresh licence and no relic purchase, even when the
+        // starting area was lowered to 4 and an affordable relic is on the shelf.
+        for (start in 1..5) {
+            val policy = LabyrinthShopPolicy(finalArea = start)
+            assertTrue(
+                "start=$start area=4 refresh",
+                policy.decide(4, disabledRow(), emptyList(), refreshAvailable = true) is LabyrinthShopDecision.Close,
+            )
+            assertTrue(
+                "start=$start area=4 buy",
+                policy.decide(
+                    4, listOf(item("relic", "会心", 1, true)), emptyList(), refreshAvailable = true,
+                ) is LabyrinthShopDecision.Close,
+            )
+        }
+    }
+
+    @Test
+    fun `area three stops refreshing after its single refill budget`() {
+        val policy = LabyrinthShopPolicy(finalArea = 3)
+        assertTrue(
+            "first refill",
+            policy.decide(
+                3, disabledRow(), emptyList(), refreshAvailable = true, refreshesUsedInVisit = 0,
+            ) is LabyrinthShopDecision.Refresh,
+        )
+        // A second 300-coin refill in area 3 used to return a row the remaining balance could not
+        // buy from, so the budget ends the visit instead.
+        val spent = policy.decide(
+            3, disabledRow(), emptyList(), refreshAvailable = true, refreshesUsedInVisit = 1,
+        )
+        assertTrue("second refill: $spent", spent is LabyrinthShopDecision.Close)
+    }
+
+    @Test
+    fun `areas without a refill budget keep refreshing on every depleted row`() {
+        val policy = LabyrinthShopPolicy()
+        for (used in listOf(0, 1, 2, 5)) {
+            assertTrue(
+                "used=$used",
+                policy.decide(
+                    5, disabledRow(), emptyList(), refreshAvailable = true, refreshesUsedInVisit = used,
+                ) is LabyrinthShopDecision.Refresh,
+            )
+        }
+    }
+
+    @Test
+    fun `area three spends the remaining coins on an imprint instead of a second refill`() {
+        val imprint = item("imprint", null, null, false,
+            kind = LabyrinthShopItemKind.ROLE_IMPRINT, roleImprintLabel = "坦克型职能印记")
+        val row = disabledRow().take(2) + imprint
+        val policy = LabyrinthShopPolicy(finalArea = 3)
+        assertTrue(
+            policy.decide(
+                3, row, emptyList(), refreshAvailable = true, refreshesUsedInVisit = 0,
+            ) is LabyrinthShopDecision.Refresh,
+        )
+        assertTrue(
+            policy.decide(
+                3, row, emptyList(), refreshAvailable = true, refreshesUsedInVisit = 1,
+            ) is LabyrinthShopDecision.BuyRoleImprint,
+        )
     }
 
     @Test

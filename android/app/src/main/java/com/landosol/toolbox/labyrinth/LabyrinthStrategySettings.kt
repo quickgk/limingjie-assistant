@@ -38,8 +38,8 @@ const val RESPONSE_INTERVAL_FAST = 300
 /** 标准档：每 2 帧处理 1 帧。这就是上游 1.0.18 之前 `FRAME_INTERVAL_MILLIS = 500` 的实际行为。 */
 const val RESPONSE_INTERVAL_STANDARD = 500
 
-/** 旧配置没有该字段时的取值：与当前项目行为（300 ms）一致。 */
-const val DEFAULT_RESPONSE_INTERVAL_MILLIS = RESPONSE_INTERVAL_FAST
+/** 旧配置没有该字段时的取值：默认标准档（500 ms），需要更快时在设置里切到 300 ms。 */
+const val DEFAULT_RESPONSE_INTERVAL_MILLIS = RESPONSE_INTERVAL_STANDARD
 
 @Serializable
 data class LabyrinthStrategySettings(

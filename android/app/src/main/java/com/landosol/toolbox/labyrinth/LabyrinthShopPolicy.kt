@@ -30,8 +30,12 @@ sealed interface LabyrinthShopDecision {
  *
  * Rules requested by the live Dry Run:
  * - relics always outrank role-imprint goods;
- * - refresh follows the configured starting area and enable switch;
- * - completed relic cycles, or a fully observed row with no actionable relic, can refresh;
+ * - area 4 never buys and never refreshes: it is a hard saving stop whose coins carry into
+ *   area 5, whatever the configured refresh starting area happens to be;
+ * - in every other area refresh follows the configured starting area and enable switch;
+ * - completed relic cycles, or a fully observed row with no actionable relic, can refresh, but
+ *   each shop visit is capped by [refreshLimitsByArea] so a refill that the remaining coins cannot
+ *   buy from is not paid for twice by mistake;
  * - when no relic can still be bought and another relic cycle cannot be refreshed, a safely
  *   identified purchasable role imprint may consume the remaining coins and enter role selection;
  * - every live good passes bounded title classification before purchase; unresolved goods are
@@ -48,6 +52,12 @@ class LabyrinthShopPolicy(
     private val ambiguousRelicLikeConfidence: Double = 0.45,
     private val buyRelics: Boolean = true,
     private val refreshEnabled: Boolean = true,
+    /**
+     * Per-area cap on 300-coin refills inside one shop visit. Area 3 defaults to a single refill:
+     * a second refill there routinely returns a row the current balance cannot buy, so it only
+     * spends coins. Areas absent from this map keep the unlimited behaviour.
+     */
+    private val refreshLimitsByArea: Map<Int, Int> = mapOf(3 to 1),
 ) {
     fun decide(
         currentArea: Int?,
@@ -58,12 +68,19 @@ class LabyrinthShopPolicy(
         lockedFocus: LabyrinthRelicMark? = null,
         relicPurchasesInCycle: Int = 0,
         refreshAvailabilityKnown: Boolean = true,
+        refreshesUsedInVisit: Int = 0,
     ): LabyrinthShopDecision {
         if (!buyRelics) return LabyrinthShopDecision.Close("策略已关闭商店购买，退出商店")
         val refreshAllowed = refreshEnabled && currentArea != null && currentArea >= finalArea
-        // Preserve the default area-4 saving rule, unless the player explicitly permits refresh
-        // there. An earlier configured starting area must not be defeated by this legacy rule.
-        if (currentArea != null && currentArea in noPurchaseAreas && !refreshAllowed) {
+        // The area budget is what keeps a shop from spending 300 coins on a refill that the
+        // remaining balance cannot buy from. Running out of budget simply falls through to the
+        // normal buy-imprint / close decisions below.
+        val refreshBudget = currentArea?.let { refreshLimitsByArea[it] }
+        val refreshPermitted = refreshAllowed && (refreshBudget == null || refreshesUsedInVisit < refreshBudget)
+        // Area 4 is a hard saving stop: no purchase and no 300-coin refresh, so the coins survive
+        // into area 5. This is independent of the configured refresh starting area -- lowering
+        // that to 3 must affect areas 3 and 5 only, never hand area 4 a spending license.
+        if (currentArea != null && currentArea in noPurchaseAreas) {
             return LabyrinthShopDecision.Close("区域${currentArea}按策略不购买商店商品，直接退出")
         }
 
@@ -98,10 +115,10 @@ class LabyrinthShopPolicy(
 
         // A committed cycle is sufficient even when the refill titles are still being read.
         if (effectiveRelicPurchasesInCycle >= relicsPerStockCycle) {
-            if (refreshAllowed && !refreshAvailabilityKnown) {
+            if (refreshPermitted && !refreshAvailabilityKnown) {
                 return LabyrinthShopDecision.Wait("遗物已买完，等待刷新按钮稳定识别")
             }
-            if (refreshAllowed && refreshAvailable) {
+            if (refreshPermitted && refreshAvailable) {
                 return LabyrinthShopDecision.Refresh(
                     if (visibleStockExhausted && relicPurchasesInCycle < relicsPerStockCycle) {
                         "当前三个商品位均为职能印记，恢复为本轮三个遗物已售罄；按策略花300刷新下一轮遗物"
@@ -176,7 +193,7 @@ class LabyrinthShopPolicy(
                 (it.purchasable && it.categoryState == LabyrinthShopCategoryState.READY &&
                     it.kind == LabyrinthShopItemKind.ROLE_IMPRINT)
         }
-        if (refreshAllowed && noActionableRelicInRow) {
+        if (refreshPermitted && noActionableRelicInRow) {
             if (!refreshAvailabilityKnown) {
                 return LabyrinthShopDecision.Wait("当前商品行没有可购买遗物，等待刷新按钮稳定识别")
             }
@@ -198,6 +215,8 @@ class LabyrinthShopPolicy(
                 items.any { it.categoryState == LabyrinthShopCategoryState.EXHAUSTED } ->
                     "未确认商品已完成三轮识别并跳过；没有可确认购买项，退出商店"
                 !refreshEnabled -> "策略禁止刷新，当前无可确认遗物或可购买印记，结束商店"
+                currentArea != null && refreshBudget != null && refreshesUsedInVisit >= refreshBudget ->
+                    "区域${currentArea}本店刷新额度已用完（上限${refreshBudget}次），结束商店"
                 (currentArea ?: 0) >= finalArea && refreshAvailable ->
                     "当前商品行尚未确认已无可购买遗物，不提前刷新；且没有可购买印记，结束商店"
                 (currentArea ?: 0) >= finalArea ->
