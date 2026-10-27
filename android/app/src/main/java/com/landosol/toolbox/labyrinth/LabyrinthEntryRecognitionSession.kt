@@ -39,6 +39,7 @@ import com.landosol.toolbox.labyrinth.vision.labyrinthRelicDetailHoldsFrame
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopDialogState
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemKind
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemStatus
+import com.landosol.toolbox.labyrinth.vision.LabyrinthSpecialEquipmentStage
 import com.landosol.toolbox.labyrinth.node.LabyrinthNodeSession
 import com.landosol.toolbox.labyrinth.node.LabyrinthNodeActionPlanner
 import com.landosol.toolbox.labyrinth.node.LabyrinthMapScanDirection
@@ -1347,7 +1348,19 @@ class LabyrinthEntryRecognitionSession(
     @Volatile
     private var specialEquipmentAwayFrames = 0
     /**
-     * 超限逃生那次点击（点弹窗1 左下白色「取消」）已经决定、但还没派发出去时的待办。
+     * 一次已经决定、但还没派发出去的超限逃生点击。
+     *
+     * [dialogStage] 是决定这一下时开着的那层弹窗：一个「取消」只对它那一层有效。等会话动作间隔的这几帧
+     * 里画面可能已经换层（弹窗2 在「自动装备」之后才出现），那时同一个「取消」矩形指向的是另一层的
+     * 按钮，照着重放就会关掉别的弹窗、把原来那层留在屏幕上。
+     */
+    private data class PendingSpecialEquipmentEscape(
+        val tap: LabyrinthSpecialEquipmentTap,
+        val dialogStage: LabyrinthSpecialEquipmentStage,
+    )
+
+    /**
+     * 超限逃生那次「取消」已经决定、但还没派发出去时的待办。
      *
      * 决策只在「超限的那一帧」带 tap，而 stage 那时已经推进到 DONE，后续帧的 DONE 决策不再带 tap；
      * 没有这个待办字段，逃生点击会被动作间隔或帧序吞掉：表现为「只被决定、从未点击」。
@@ -1355,7 +1368,17 @@ class LabyrinthEntryRecognitionSession(
      * 由「本轮已结束但弹窗仍开着」的分支停机并保留诊断。
      */
     @Volatile
-    private var specialEquipmentPendingEscape: LabyrinthSpecialEquipmentTap? = null
+    private var specialEquipmentPendingEscape: PendingSpecialEquipmentEscape? = null
+    /**
+     * 逃生已经用掉的弹窗层：那一层上的「取消」已经派发过，或者等它派发的窗口已经超期。
+     *
+     * 每一层只用一次：逃生要的是「逐层退回编组页」，同一层上重复点「取消」只会落到下一层的按钮上；
+     * 窗口超期的那一层也不再重挂，否则「派发不出去」会变成每 8 秒重来一次的无界等待。
+     */
+    private val specialEquipmentEscapeSpentStages = linkedSetOf<LabyrinthSpecialEquipmentStage>()
+    /** 本步上一次真正派发点击的时刻（重试节奏用）；本步还没派发过时是 [Long.MIN_VALUE]。 */
+    @Volatile
+    private var specialEquipmentStepLastDispatchAt = Long.MIN_VALUE
     /** 逃生点击派发后的等弹窗关闭上限；超期仍未关就停机并保留诊断。 */
     @Volatile
     private var specialEquipmentEscapeDeadline = Long.MIN_VALUE
@@ -2370,7 +2393,17 @@ class LabyrinthEntryRecognitionSession(
             handleBattleWaitFrame(sessionId, result, timestampMillis)
         ) return
         val relicDetail = result.relicDetailObservation
-        if (relicDetail != null && labyrinthRelicDetailHoldsFrame(result)) {
+        val relicDetailHoldsFrame = relicDetail != null && labyrinthRelicDetailHoldsFrame(result)
+        if (relicDetailHoldsFrame && !current.dryRun && specialEquipmentAwaitsDialog()) {
+            // 「特别装备」正等着弹窗1/弹窗2 出现时，弹窗显现/关闭的过渡帧与「系列效果一览」共用同一套
+            // 面板外观，识别器在过渡帧上给不出 stage，这一帧就会被下面的系列详情持帧判定整帧吞掉——
+            // 本轮等的正是这个弹窗。所以只等一帧：不持帧、不点击，也不推进系列详情的持帧计时。
+            publishSpecialEquipmentMessage(
+                "特别装备：等待弹窗出现，暂不执行点击（当前画面与系列详情面板外观相同）",
+            )
+            return
+        }
+        if (relicDetail != null && relicDetailHoldsFrame) {
             // This popup is only ever opened by hand, and the run deliberately does not close it
             // so the operator can read it. That made it an unbounded wait: a popup left open (or
             // one the classifier keeps seeing) parked the route with no deadline at all. Reading
@@ -6249,6 +6282,8 @@ class LabyrinthEntryRecognitionSession(
         specialEquipmentStepStartedAt = Long.MIN_VALUE
         specialEquipmentAwayFrames = 0
         specialEquipmentPendingEscape = null
+        specialEquipmentEscapeSpentStages.clear()
+        specialEquipmentStepLastDispatchAt = Long.MIN_VALUE
         specialEquipmentEscapeDeadline = Long.MIN_VALUE
         specialEquipmentDiagnostic = null
         specialEquipmentAbandoned = false
@@ -6256,6 +6291,20 @@ class LabyrinthEntryRecognitionSession(
         specialEquipmentModalCloseSettlePending = false
         specialEquipmentEquipEvidence = LabyrinthSpecialEquipmentEquipEvidenceStreak()
         specialEquipmentRoundBossTeamIndex = null
+    }
+
+    /**
+     * 本轮特别装备是否正等着弹窗1/弹窗2 出现。
+     *
+     * 这几步里画面会被弹窗本身或它的显现动画占据；与这两个弹窗共用面板外观的「系列效果一览」持帧判定
+     * 不能把这种帧拿走——拿走了流程只能干等下一帧，而弹窗的显现往往只持续一两帧。
+     */
+    private fun specialEquipmentAwaitsDialog(): Boolean = when (specialEquipmentFlowStage) {
+        LabyrinthSpecialEquipmentFlowStage.AWAIT_MAIN_DIALOG,
+        LabyrinthSpecialEquipmentFlowStage.AWAIT_AUTO_DIALOG,
+        LabyrinthSpecialEquipmentFlowStage.AWAIT_SECOND_MAIN_DIALOG,
+        -> true
+        else -> false
     }
 
     /** 当前页签的队伍成员：每个槽位一个 `characterId`，未识别的槽位是 null。 */
@@ -6414,6 +6463,7 @@ class LabyrinthEntryRecognitionSession(
             specialEquipmentFlowStage = LabyrinthSpecialEquipmentFlowStage.AWAIT_ENTRY
             specialEquipmentStepAttempts = 0
             specialEquipmentStepStartedAt = timestampMillis
+            specialEquipmentStepLastDispatchAt = Long.MIN_VALUE
             specialEquipmentRoundBossTeamIndex = bossTeamIndex.takeIf { bossMultiTeamTab }
         }
 
@@ -6433,12 +6483,21 @@ class LabyrinthEntryRecognitionSession(
         )
         specialEquipmentEquipEvidence = equipEvidence
 
+        // 本步距离上一次**真正派发**过去了多久：决策用它给「点「自动装备」后等弹窗2」限速
+        // （未知 ⇒ 视为很久以前，首帧/换步之后立刻可点）。
+        val sinceLastStepDispatchMillis = if (specialEquipmentStepLastDispatchAt == Long.MIN_VALUE) {
+            Long.MAX_VALUE
+        } else {
+            (timestampMillis - specialEquipmentStepLastDispatchAt).coerceAtLeast(0L)
+        }
+
         val decision = labyrinthSpecialEquipmentDecision(
             stage = specialEquipmentFlowStage,
             observation = observation,
             stepAttempts = specialEquipmentStepAttempts,
             stepElapsedMillis = stepElapsedMillis,
             equipConfirmEnabled = equipEvidence.confirmedEnabled,
+            sinceLastStepDispatchMillis = sinceLastStepDispatchMillis,
         )
         // 只在本轮真正（武装后）看到过弹窗的帧上记账：用户手动打开的弹窗不引入任何新等待。
         if (dialogOpen) specialEquipmentDialogObserved = true
@@ -6453,8 +6512,13 @@ class LabyrinthEntryRecognitionSession(
                 if (specialEquipmentDiagnostic == null) specialEquipmentDiagnostic = decision.message
                 specialEquipmentAbandoned = true
             }
-            if (decision.tap != null) {
-                specialEquipmentPendingEscape = decision.tap
+            val escapeStage = observation?.stage
+            if (decision.tap != null && escapeStage != null) {
+                // 逃生点击绑定到**这一帧**还开着的那层弹窗：等间隔的这几帧里画面可能换层。
+                specialEquipmentPendingEscape = PendingSpecialEquipmentEscape(
+                    tap = decision.tap,
+                    dialogStage = escapeStage,
+                )
                 // 待办本身也有窗口：窗口内始终派发不出去（例如单动作锁一直被占）就放弃这次点击，
                 // 交给下面「本轮已结束但弹窗仍开着」的分支停机并保留诊断，不引入无界等待。
                 specialEquipmentEscapeDeadline =
@@ -6466,11 +6530,50 @@ class LabyrinthEntryRecognitionSession(
             specialEquipmentEscapeDeadline != Long.MIN_VALUE &&
             timestampMillis >= specialEquipmentEscapeDeadline
         ) {
+            specialEquipmentPendingEscape?.let { specialEquipmentEscapeSpentStages.add(it.dialogStage) }
             specialEquipmentPendingEscape = null
         }
+        val currentDialogStage = observation?.stage
+        // 待办的逃生点击只对它被决定时的那一层弹窗有效：画面已经换层就作废，改按当前这一层重挂。
+        if (
+            specialEquipmentPendingEscape != null &&
+            currentDialogStage != null &&
+            specialEquipmentPendingEscape?.dialogStage != currentDialogStage
+        ) {
+            specialEquipmentPendingEscape = null
+        }
+        // 本轮已经放弃、弹窗却还开着：按当前这一层重新挂一次逃生点击。两层各一次「取消」必然逐层退回
+        // 编组页（弹窗2 → 弹窗1 → 编组页）；同一层点过就不再点，两层都点过才走下面的停机分支。
+        if (
+            decision.finished &&
+            specialEquipmentAbandoned &&
+            specialEquipmentPendingEscape == null &&
+            currentDialogStage != null &&
+            observation.cancelButtonRect != null &&
+            currentDialogStage !in specialEquipmentEscapeSpentStages
+        ) {
+            specialEquipmentPendingEscape = PendingSpecialEquipmentEscape(
+                tap = LabyrinthSpecialEquipmentTap.CANCEL,
+                dialogStage = currentDialogStage,
+            )
+            specialEquipmentEscapeDeadline =
+                timestampMillis + SPECIAL_EQUIPMENT_ESCAPE_TIMEOUT_MILLIS
+        }
 
-        val tap = decision.tap ?: specialEquipmentPendingEscape
-        val rect = tap?.let { current -> observation?.let { labyrinthSpecialEquipmentTapRect(current, it) } }
+        val pendingEscape = specialEquipmentPendingEscape
+        val tap = decision.tap ?: pendingEscape?.tap
+        // 本帧决策给出的点击就落在本帧观测的按钮上；待办的逃生点击只在同一层弹窗还开着时有效。
+        // 矩形一律从观测里取、不缓存坐标：换层之后不会把同一个「取消」重放到另一层的按钮上。
+        val currentObservation = observation
+        val deferredEscapeLayerMatches =
+            pendingEscape != null && currentDialogStage == pendingEscape.dialogStage
+        val rect = when {
+            tap == null -> null
+            currentObservation == null -> null
+            decision.tap != null -> labyrinthSpecialEquipmentTapRect(tap, currentObservation)
+            deferredEscapeLayerMatches -> labyrinthSpecialEquipmentTapRect(tap, currentObservation)
+            else -> null
+        }
         val tapReady = rect != null && sessionActionIntervalElapsed(timestampMillis)
         // **「决定要点击」不等于「点击已经派发」**：会话动作间隔（[BATTLE_TEAM_ACTION_INTERVAL_MILLIS]）
         // 与单动作锁都可能把这一下挡在派发之前。此时若把 stage 推进到下一状态，就等于宣布「已经点过
@@ -6565,10 +6668,12 @@ class LabyrinthEntryRecognitionSession(
         }
         if (decision.tap != null) {
             specialEquipmentStepAttempts++
+            specialEquipmentStepLastDispatchAt = timestampMillis
         }
         if (decision.finished) {
-            // 逃生点击**只点一次**——派发成功后立刻清待办，否则下一个动作间隔（≥1.2s）到来时残留的
-            // pendingEscape 会再点一次「取消」，与本段的语义和注释都不符。
+            // 逃生点击**每一层只点一次**——派发成功后立刻清待办并记下这一层，否则下一个动作间隔
+            // （≥1.2s）到来时残留的 pendingEscape 会再点一次「取消」，落到下一层或编组页的按钮上。
+            pendingEscape?.let { specialEquipmentEscapeSpentStages.add(it.dialogStage) }
             specialEquipmentPendingEscape = null
             specialEquipmentEscapeDeadline =
                 timestampMillis + SPECIAL_EQUIPMENT_ESCAPE_TIMEOUT_MILLIS
@@ -6590,6 +6695,7 @@ class LabyrinthEntryRecognitionSession(
         if (decision.stage != specialEquipmentFlowStage) {
             specialEquipmentStepAttempts = 0
             specialEquipmentStepStartedAt = timestampMillis
+            specialEquipmentStepLastDispatchAt = Long.MIN_VALUE
         }
         specialEquipmentFlowStage = decision.stage
     }
