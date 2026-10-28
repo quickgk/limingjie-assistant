@@ -200,6 +200,25 @@ data class LabyrinthRunRelicEntity(
     @ColumnInfo(name = "observation_count") val observationCount: Int,
 )
 
+@Entity(
+    tableName = "labyrinth_shop_ownership",
+    primaryKeys = ["run_key", "receipt_id"],
+    foreignKeys = [
+        ForeignKey(
+            entity = LabyrinthRunStateEntity::class,
+            parentColumns = ["run_key"],
+            childColumns = ["run_key"],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
+    indices = [Index(value = ["run_key", "committed_at"])],
+)
+data class LabyrinthShopOwnershipEntity(
+    @ColumnInfo(name = "run_key") val runKey: String,
+    @ColumnInfo(name = "receipt_id") val receiptId: String,
+    @ColumnInfo(name = "committed_at") val committedAt: Long,
+)
+
 @Entity(tableName = "migration_checkpoints")
 data class MigrationCheckpointEntity(
     @PrimaryKey @ColumnInfo(name = "checkpoint_key") val checkpointKey: String,

@@ -44,8 +44,12 @@ data class LabyrinthShopItemMatch(
     val titleEvidenceId: Long? = null,
     val categoryState: LabyrinthShopCategoryState = LabyrinthShopCategoryState.READY,
     val categoryAttempt: Int = 0,
+    /** 当前商品价格必须经过两次独立OCR，不从星级推算。 */
+    val priceRead: LabyrinthShopReceiptRead? = null,
 ) {
     val purchasable: Boolean get() = status == LabyrinthShopItemStatus.AVAILABLE
+    val verifiedPrice: Long? get() = priceRead?.takeIf { it.confirmations >= 2 }?.text
+        ?.let(LabyrinthShopPurchaseReceiptObservation::parseAmount)?.takeIf { it > 0 }
 }
 
 /** Pure helper so noisy shop-title OCR can be tested without Android/ML Kit. */
@@ -121,7 +125,15 @@ data class LabyrinthShopObservation(
     val refreshButtonEnabledEvidence: Double = 0.0,
     /** The relic shown in the purchase-confirmation dialog, if the icon is trusted. */
     val purchaseCandidate: LabyrinthRelicMatch? = null,
+    /** 疑似回执正在读取时也必须阻止底层商店操作。 */
+    val purchaseReceipt: LabyrinthShopPurchaseReceiptObservation? = null,
+    val refreshPriceRead: LabyrinthShopReceiptRead? = null,
+    val priceReviewReason: String? = null,
 ) {
+    val verifiedRefreshPrice: Long? get() = refreshPriceRead?.takeIf { it.confirmations >= 2 }?.text
+        ?.let(LabyrinthShopPurchaseReceiptObservation::parseAmount)?.takeIf { it > 0 }
+    val pricesReviewed: Boolean get() = items.isNotEmpty() && items.all { it.verifiedPrice != null } &&
+        verifiedRefreshPrice != null && priceReviewReason == null
     val availableItemCount: Int get() = items.count(LabyrinthShopItemMatch::purchasable)
     val recognizedButtonCount: Int get() = items.count { it.buyButtonScore >= BUTTON_MIN_CONFIDENCE }
     val refreshButtonEnabled: Boolean get() = refreshButtonEnabledEvidence >= 0.50

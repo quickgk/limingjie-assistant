@@ -57,6 +57,28 @@ import com.landosol.toolbox.labyrinth.node.NodeTopologyBindingKind
 import com.landosol.toolbox.labyrinth.node.NodeDebugLogger
 import com.landosol.toolbox.labyrinth.node.NodeSessionState
 import com.landosol.toolbox.labyrinth.node.NodeTemplateSet
+import android.graphics.Bitmap
+import com.landosol.toolbox.labyrinth.shop.LabyrinthShoppingJournal
+import com.landosol.toolbox.labyrinth.shop.LabyrinthShoppingModule
+import com.landosol.toolbox.labyrinth.shop.PendingOwnership
+import com.landosol.toolbox.labyrinth.vision.LabyrinthShopReceiptRead
+import com.landosol.toolbox.labyrinth.vision.LabyrinthCurrencyObservation
+import java.util.UUID
+import com.landosol.toolbox.labyrinth.shop.LabyrinthShopReceiptLedger.Companion.id as shoppingEventId
+import com.landosol.toolbox.labyrinth.shop.LabyrinthShopReceiptLedger.Companion.payload as shoppingEventPayload
+import com.landosol.toolbox.labyrinth.shop.LabyrinthShopReceiptLedger.Companion.pendingIntent as shoppingPendingIntent
+import com.landosol.toolbox.labyrinth.shop.LabyrinthShopReceiptLedger.Companion.type as shoppingEventType
+import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemText
+import com.landosol.toolbox.labyrinth.vision.LabyrinthShopPurchaseReceiptObservation
+import java.io.ByteArrayOutputStream
+import java.io.FileOutputStream
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
@@ -449,6 +471,32 @@ internal const val ACTION_LATCH_STUCK_TIMEOUT_MILLIS = 60_000L
  * several times that margin while still guaranteeing the run terminates.
  */
 internal const val POST_ENTRY_STALL_TIMEOUT_MILLIS = 120_000L
+
+/**
+ * 购物流程连续无进展多久后停止整局。
+ *
+ * 购物是唯一「既不能盲点、也不许退出兜底」的流程：回执读不出、刷新差额对不上、确认页丢了预算
+ * 证据时，它只能等。等是必要的（六字段双读、Room 对账都需要几个节拍），但 hold 帧会让
+ * processFrameResult 直接返回、绕过通用停滞看门狗，所以期限必须自带，否则无人值守批跑会静默挂住。
+ *
+ * 180 秒覆盖 20 秒的标题 OCR 兜底与串行 OCR 排队的最坏情况，仍保证一定终止并留下原因。
+ */
+internal const val SHOPPING_HOLD_TIMEOUT_MILLIS = 180_000L
+
+/** 购物 hold 是否已经等够，需要停止而不是继续等。 */
+internal fun labyrinthShoppingHoldExpired(
+    heldMillis: Long,
+    limitMillis: Long = SHOPPING_HOLD_TIMEOUT_MILLIS,
+): Boolean = heldMillis >= limitMillis
+
+/**
+ * 同一段无进展里，购物手势连续被确定拒绝多少次就停止。
+ *
+ * 每次重试都会写一条购买意图和一张整帧 PNG（拒绝只取消意图，不会删已落盘的证据），1.5 秒的
+ * 重试间隔下等到 180 秒期限会留下上百张整帧图。三次确定拒绝已经是「点不动」的明确信号，
+ * 先停比继续写更划算。
+ */
+internal const val SHOPPING_REJECTION_BUDGET = 3
 
 /**
  * 编组页两次动作之间的点击防抖间隔，本会话内**任意**两次点击（特别装备流程与编组/开战共用）都受它约束。
@@ -1111,7 +1159,11 @@ class LabyrinthEntryRecognitionSession(
     private val gameLauncher: () -> Boolean = { true },
     private val actionPlannerFactory: () -> LabyrinthEntryActionPlanner = { LabyrinthEntryActionPlanner() },
     private var relicChoicePolicy: LabyrinthRelicChoicePolicy = LabyrinthRelicChoicePolicy(),
-    private var shopPolicy: LabyrinthShopPolicy = LabyrinthShopPolicy(relicChoicePolicy),
+    /**
+     * 调用方注入的购物策略原样使用；为 null 时才按是否接入购物模块构造默认策略
+     * （接入模块即开启预算优化，生产装配恒为开启）。
+     */
+    shopPolicy: LabyrinthShopPolicy? = null,
     private var roleRewardChoicePlanner: LabyrinthRoleRewardChoicePlanner? = null,
     private val roleRewardChoiceUnavailableReason: String? = null,
     private var eventChoicePlanner: LabyrinthEventChoicePlanner? = null,
@@ -1141,7 +1193,82 @@ class LabyrinthEntryRecognitionSession(
     private val runTerminalListener: (suspend (LabyrinthRunTerminalEvent) -> Unit)? = null,
     /** Channel SDK login dialogs (九游) on the way from the title, read via accessibility. */
     private val channelPrompts: com.landosol.toolbox.automation.session.ChannelLoginPromptAssistant? = null,
+    private val shoppingRelicResolver: (String) -> LabyrinthRelicMatch? = { null },
+    private val shoppingJournal: LabyrinthShoppingJournal? = null,
+    private val shoppingModule: LabyrinthShoppingModule? = null,
 ) {
+    private val injectedShopPolicy: LabyrinthShopPolicy? = shopPolicy
+
+    /**
+     * 购物策略：注入值优先，缺省时才按「是否接入购物模块」决定预算优化开关。
+     *
+     * 生产装配（LandosolToolboxApplication）注入了 shoppingModule，所以预算优化恒开；旧分支只
+     * 为未接模块的测试与回放保留，没有面向用户的开关。
+     */
+    private var shopPolicy: LabyrinthShopPolicy = injectedShopPolicy ?: LabyrinthShopPolicy(
+        relicChoicePolicy,
+        budgetOptimizationEnabled = shoppingModule != null,
+    )
+
+    /** 15秒是前帧双读价格、钱包与原始PNG的预算证据有效期，不是实时确认页金额OCR。 */
+    private data class ShoppingBudgetLease(
+        val intentId: String?,
+        val price: Long,
+        val balance: Long,
+        val nodeId: Long,
+        val floor: Int,
+        val enterId: Long,
+        val accountId: Long?,
+        val sessionId: AutomationSessionId?,
+        val observedAt: Long,
+        val png: ByteArray,
+        val financialEventIds: List<String>,
+    )
+
+    private data class ShoppingRefreshEvidence(
+        val lease: ShoppingBudgetLease,
+        val priceRead: LabyrinthShopReceiptRead,
+        val balanceObservation: LabyrinthCurrencyObservation,
+        val attemptKey: String = UUID.randomUUID().toString(),
+        var prepared: Boolean = false,
+        var confirmedAt: Long? = null,
+    ) {
+        val price get() = lease.price
+        val balance get() = lease.balance
+        val nodeId get() = lease.nodeId
+        val floor get() = lease.floor
+        val png get() = lease.png
+    }
+
+    private var shoppingRunInitialized = false
+    private var shoppingRunAccountId: Long? = null
+    private var shoppingRunBatchId: String? = null
+    private var shoppingObservedFrameAt = Long.MIN_VALUE
+    private var shoppingPurchaseLease: ShoppingBudgetLease? = null
+    @Volatile private var shoppingConfirmationInFlight = false
+    private var shoppingFrameEncoder: ((FileOutputStream) -> Boolean)? = null
+    private var shoppingFramePng: (() -> ByteArray)? = null
+    private var shoppingConfirmDispatchedPending = false
+    private var shoppingPurchaseCandidate: LabyrinthRelicMatch? = null
+    private var shoppingRefreshEvidence: ShoppingRefreshEvidence? = null
+    private var shoppingError: String? = null
+    private var shoppingDismissedReceiptKey: String? = null
+    private var shoppingReadyReceiptKey: String? = null
+    private val shoppingCountedReceipts = mutableSetOf<String>()
+    private val shoppingOwnershipInFlight = AtomicBoolean(false)
+    /**
+     * 购物流程最后一次真实进展（意图、prepared、回执、持有提交、可关闭）的时间。
+     *
+     * hold 帧会让 processFrameResult 直接返回，通用停滞看门狗不会运行，所以这个时间戳是购物
+     * 等待的唯一期限来源：连续无进展超过 [SHOPPING_HOLD_TIMEOUT_MILLIS] 即停止整局并保留诊断。
+     */
+    private var shoppingLastProgressAt = Long.MIN_VALUE
+    /** 上一次 hold 时的页面，用来识别「页面真的变了」而不是「每一帧都在别的页面」。 */
+    private var shoppingHoldPage: LabyrinthEntryPageState? = null
+    /** 本段无进展只给一次过渡额度，避免页面在 UNKNOWN 与商店页之间抖动时被无限重置。 */
+    private var shoppingTransitionGranted = false
+    /** 本段无进展里连续被确定拒绝的次数；真实落地或回执入账会清零。 */
+    private var shoppingRejectionsInStreak = 0
     private data class QueuedFrame(
         val sessionId: AutomationSessionId,
         val processor: (CapturedFrame) -> LabyrinthEntryFrameResult,
@@ -1505,7 +1632,7 @@ class LabyrinthEntryRecognitionSession(
     private var plannedShopRefreshConfirmedAt = Long.MIN_VALUE
     @Volatile
     private var shopRelicPurchasesThisCycle = 0
-    /** 300-coin refills already paid for in the current shop node; cleared on every shop entry. */
+    /** 当前节点保守消耗的刷新额度；耐久 prepared 计一次，确定 rejected 才释放。 */
     @Volatile
     private var shopRefreshesThisVisit = 0
     @Volatile
@@ -1820,11 +1947,12 @@ class LabyrinthEntryRecognitionSession(
             singleBossRetryCountBeforeMulti = snapshot.settings.singleBossRetryCountBeforeMulti
             rerollAfterThreeBattleFailures = snapshot.settings.rerollAfterThreeBattleFailures
             relicChoicePolicy = snapshot.settings.relicPolicy()
-            shopPolicy = LabyrinthShopPolicy(
+            shopPolicy = injectedShopPolicy ?: LabyrinthShopPolicy(
                 relicChoicePolicy = relicChoicePolicy,
                 finalArea = snapshot.settings.refreshFromArea,
                 buyRelics = snapshot.settings.buyRelics,
                 refreshEnabled = snapshot.settings.refreshShop,
+                budgetOptimizationEnabled = shoppingModule != null,
             )
             configuredOpeningRosters = snapshot.settings.openingRosters
             roleDisplayNames = snapshot.roleRuntime?.document?.characters
@@ -2185,6 +2313,14 @@ class LabyrinthEntryRecognitionSession(
             // stop()/pause may run while an expensive frame is being recognized. Never let that
             // stale result mutate a stopped/paused session or publish an old dashboard frame.
             if (activeSessionId != sessionId || _state.value.paused) return@runCatching
+            // 仅在原始捕获 Bitmap 尚有效的这一段提供编码器；异步动作只能持有已编码字节。
+            shoppingFrameEncoder = { output -> frame.bitmap.compress(Bitmap.CompressFormat.PNG, 100, output) }
+            shoppingFramePng = {
+                ByteArrayOutputStream().use { output ->
+                    check(frame.bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) { "刷新原图编码失败" }
+                    output.toByteArray()
+                }
+            }
             processFrameResult(
                 sessionId = sessionId,
                 result = result,
@@ -2201,7 +2337,11 @@ class LabyrinthEntryRecognitionSession(
         }.onFailure { error ->
             handleFrameFailure(sessionId, error)
         }
-            .also { recycle(frame) }
+            .also {
+                shoppingFrameEncoder = null
+                shoppingFramePng = null
+                recycle(frame)
+            }
     }
 
     private fun handleFrameFailure(sessionId: AutomationSessionId, error: Throwable) {
@@ -2229,14 +2369,32 @@ class LabyrinthEntryRecognitionSession(
             )
         }
 
+        var shoppingLatchHeld = false
         if (labyrinthActionLatchStuck(actionInFlightSince, timestampMillis) && actionInFlight.get()) {
-            val heldFor = timestampMillis - actionInFlightSince
-            endGuardedAction()
-            finishFromPlanner(
-                sessionId,
-                "动作执行超过${heldFor / 1000}秒未返回（手势可能未落地），已释放动作锁并停止以保留诊断状态",
-            )
-            return
+            // 只有「卡住的确实是购物动作」才谈购物超期，否则一个普通动作卡住会把诊断写成购物。
+            val shoppingHoldActive = shoppingOwnershipInFlight.get() || shoppingConfirmationInFlight ||
+                shoppingConfirmDispatchedPending || shoppingRefreshEvidence?.prepared == true
+            // 购物 hold（等回执、持有提交、确认派发、刷新 prepared）期间动作锁是被故意保留的；
+            // 这种锁一旦卡死，挂起的停止请求永远等不到 flush，所以购物期限已过就释放并停止。
+            // 购买/刷新按钮本身卡住不属于这四种 hold，仍走下面的通用 60 秒出口。
+            val shoppingDeadlinePassed = shoppingHoldActive && shoppingLastProgressAt != Long.MIN_VALUE &&
+                labyrinthShoppingHoldExpired(timestampMillis - shoppingLastProgressAt)
+            if (shoppingHoldActive && !shoppingDeadlinePassed) {
+                // 超时不释放购物动作锁，但仍须经过原门禁读取并耐久保存财务事实。
+                shoppingLatchHeld = true
+            } else {
+                val heldFor = timestampMillis - actionInFlightSince
+                endGuardedAction()
+                finishFromPlanner(
+                    sessionId,
+                    if (shoppingDeadlinePassed) {
+                        "购物动作超过${heldFor / 1000}秒未返回且购物等待已超期，已释放动作锁并停止以保留诊断状态"
+                    } else {
+                        "动作执行超过${heldFor / 1000}秒未返回（手势可能未落地），已释放动作锁并停止以保留诊断状态"
+                    },
+                )
+                return
+            }
         }
         val current = _state.value
         _state.value = current.copy(
@@ -2254,6 +2412,7 @@ class LabyrinthEntryRecognitionSession(
         )
         val pageState = result.observation.state
         if (clock() < channelPromptVisibleUntil) {
+            invalidateShoppingLeases()
             // The channel prompt poll owns the screen; nothing behind the dialog may be tapped.
             channelPromptMessage?.let { message -> _state.value = _state.value.copy(message = message) }
             return
@@ -2268,6 +2427,13 @@ class LabyrinthEntryRecognitionSession(
                 dryRun = current.dryRun,
             )
         ) {
+            invalidateShoppingLeases()
+            return
+        }
+        // 财务回执必须先保存并提交持有，不能先触发页面变更、购买计数或普通 recordPage。
+        if (!current.dryRun && handleShoppingFrame(sessionId, result, timestampMillis, shoppingFrameEncoder)) return
+        if (shoppingLatchHeld) {
+            holdShopping("购物动作仍在执行，仅更新财务事实；保留动作锁等待回调，不推进页面或重复点击")
             return
         }
         if (skipRoleRewardJoinedRecognition &&
@@ -3053,6 +3219,348 @@ class LabyrinthEntryRecognitionSession(
         _state.value = _state.value.copy(eventChoiceDecision = decision, message = message)
     }
 
+    private fun shoppingNodeId(): Long? =
+        confirmedNodeEntryReceipt?.transition?.takeIf { it.blockType == LabyrinthNodeTypes.SHOP }?.blockId
+            ?: pendingNodeTransition?.takeIf { it.blockType == LabyrinthNodeTypes.SHOP }?.blockId
+            ?: nodeSession?.getState()?.currentNodeId
+            ?: validatedRoute?.currentBlockId
+
+    private fun shoppingFloor(): Int? = labyrinthNodeAreaOf(shoppingNodeId()) ?: activeNodeArea
+
+    private fun shoppingEvents(): List<JsonObject> = checkNotNull(shoppingModule).events()
+
+    private fun ensureShoppingRun(now: Long) {
+        val module = checkNotNull(shoppingModule)
+        check(shoppingJournal == null || module.ownsJournal(shoppingJournal)) { "购物module与构造journal不是同一对象，自动购物已禁用" }
+        val enterId = checkNotNull(validatedRoute?.enterId?.takeIf { it > 0 }) { "实际 enter 未核实，自动购物已禁用" }
+        if (shoppingRunInitialized && module.enterId == enterId && module.active &&
+            shoppingRunAccountId == activeRunAccountId && shoppingRunBatchId == currentRunId) return
+        check(!shoppingRunInitialized || (!shoppingConfirmationInFlight && !shoppingConfirmDispatchedPending &&
+            shoppingRefreshEvidence?.prepared != true && !shoppingOwnershipInFlight.get())) { "购物动作尚待回执，不能改绑账号或enter" }
+        shoppingPurchaseLease = null
+        shoppingRefreshEvidence = null
+        shoppingRunInitialized = false
+        module.open(activeRunAccountId, enterId, currentRunId, now)
+        shoppingRunAccountId = activeRunAccountId
+        shoppingRunBatchId = currentRunId
+        shoppingRunInitialized = true
+        noteShoppingProgress(now)
+        shoppingCountedReceipts.clear()
+        shoppingDismissedReceiptKey = null
+        val events = shoppingEvents()
+        val nodeId = shoppingNodeId()
+        shopRefreshesThisVisit = module.refreshCount(nodeId, shoppingFloor())
+        val cycleStart = module.refreshCycleStart(nodeId, shoppingFloor())
+        val owned = events.filter { shoppingEventType(it) == "shop.purchase_completed" && events.any { marker ->
+            shoppingEventType(marker) == "shop.ownership_committed" &&
+                shoppingEventPayload(marker)["receipt_id"] == it["event_id"]
+        } }
+        shoppingCountedReceipts += owned.map(::shoppingEventId)
+        shopRelicPurchasesThisCycle = owned.count { it["node_id"]?.jsonPrimitive?.longOrNull == nodeId &&
+            (it["seq"]?.jsonPrimitive?.intOrNull ?: 0) > cycleStart &&
+            shoppingEventPayload(it)["automated"]?.jsonPrimitive?.booleanOrNull == true &&
+            shoppingEventPayload(it)["item_id"]?.jsonPrimitive?.contentOrNull != null }
+    }
+
+    private fun holdShopping(reason: String, failure: Boolean = false): Boolean {
+        if (failure) shoppingError = "购物账本可重试错误：$reason；保留弹窗，禁止购物动作"
+        _state.value = _state.value.copy(message = if (failure) shoppingError else reason)
+        resetPostEntryStall()
+        // 购物 hold 会让 processFrameResult 直接 return，通用停滞看门狗不会运行，期限只能在这里。
+        //
+        // 每一次 hold 都属于同一段无进展，只有「页面状态发生变化」可以换一次过渡额度：一次读条、
+        // 一次弹窗退场因此不受影响；而持续停在 UNKNOWN（回执读不出）、停在别的页面（跨节点的
+        // 未决刷新）同样会在期限后停止，不会因为页面不是商店页就无限等下去。
+        val now = clock()
+        val page = _state.value.lastResult?.observation?.state
+        if (shoppingLastProgressAt == Long.MIN_VALUE) {
+            shoppingLastProgressAt = now
+            shoppingTransitionGranted = false
+        }
+        if (page != shoppingHoldPage) {
+            shoppingHoldPage = page
+            if (!shoppingTransitionGranted) {
+                shoppingTransitionGranted = true
+                shoppingLastProgressAt = now
+                return true
+            }
+        }
+        val heldMillis = now - shoppingLastProgressAt
+        if (!labyrinthShoppingHoldExpired(heldMillis)) return true
+        // 不在这里前移 shoppingLastProgressAt：停止请求发出后可能还有真实进展，flush 时要按
+        // 当前时间重新判断是否仍然超期。
+        if (pendingShoppingStop.get() == null) {
+            requestShoppingStop(
+                "购物流程连续${heldMillis / 1000}秒无进展（当前页面 ${page?.name ?: "未知"}）：" +
+                    "${shoppingError ?: reason}；已停止并保留诊断状态",
+            )
+        }
+        return true
+    }
+
+    /** 购物流程真的往前走了一步；只有它会重置 [shoppingLastProgressAt] 与过渡额度。 */
+    private fun noteShoppingProgress(now: Long = clock()) {
+        shoppingLastProgressAt = now
+        shoppingHoldPage = null
+        shoppingTransitionGranted = false
+        shoppingRejectionsInStreak = 0
+        // 已经落地的进展取消挂起的停止请求：动作成功之后不能再按旧期限把整局停掉。
+        pendingShoppingStop.get()?.let { pending ->
+            if (pending.sessionId == activeSessionId) pendingShoppingStop.compareAndSet(pending, null)
+        }
+    }
+
+    private fun unresolvedShoppingRefresh(): JsonObject? = checkNotNull(shoppingModule).pendingRefresh()
+
+    private fun unsettledShoppingOwnership(events: List<JsonObject>): Boolean = events.any { event ->
+        shoppingEventType(event) == "shop.purchase_completed" &&
+            shoppingEventPayload(event)["automated"]?.jsonPrimitive?.booleanOrNull == true && events.none { marker ->
+                shoppingEventType(marker) == "shop.ownership_committed" &&
+                    shoppingEventPayload(marker)["receipt_id"] == event["event_id"]
+            }
+    }
+
+    private fun shoppingFinancialEventIds(events: List<JsonObject>): List<String> = events.filter {
+        shoppingEventType(it) in setOf("currency.observed", "currency.observed_pending_refresh", "shop.purchase_completed", "shop.refresh_prepared", "shop.refresh_rejected", "shop.refresh_dispatched", "shop.refresh_settled", "shop.refreshed",
+            "battle.completed", "battle.reward", "event.choice_dispatched", "event.reward")
+    }.map(::shoppingEventId)
+
+    private fun shoppingLeaseValid(lease: ShoppingBudgetLease, result: LabyrinthEntryFrameResult, now: Long): Boolean {
+        val page = result.observation.state
+        val allowedPage = page in setOf(LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION,
+            LabyrinthEntryPageState.UNKNOWN, LabyrinthEntryPageState.GAME_LOADING_PROGRESS,
+            LabyrinthEntryPageState.PRE_HOME_DATA_LOADING)
+        val shop = result.shopObservation
+        val events = shoppingEvents()
+        val context = lease.intentId?.let { id -> events.singleOrNull { shoppingEventId(it) == id }?.let(::shoppingEventPayload) }
+        val currentPricesMatch = if (lease.intentId == null) {
+            shop?.refreshPriceRead == null || shop.verifiedRefreshPrice == lease.price
+        } else context != null && (shop?.items.isNullOrEmpty() || shop?.items?.singleOrNull {
+            it.slotId == context["slot_id"]?.jsonPrimitive?.contentOrNull
+        }?.let { it.verifiedPrice == lease.price &&
+            (it.relicMatch?.displayName ?: it.titleText)?.filterNot(Char::isWhitespace) == context["item_name"]?.jsonPrimitive?.contentOrNull &&
+            it.relicMatch?.relicId == context["item_id"]?.jsonPrimitive?.contentOrNull &&
+            it.roleImprintLabel == context["role_label"]?.jsonPrimitive?.contentOrNull } == true)
+        val candidate = shop?.purchaseCandidate
+        val candidateMatches = candidate == null || (context != null && candidate.recognized &&
+            candidate.relicId == context["item_id"]?.jsonPrimitive?.contentOrNull &&
+            candidate.displayName?.filterNot(Char::isWhitespace) == context["item_name"]?.jsonPrimitive?.contentOrNull)
+        return allowedPage && currentPricesMatch && candidateMatches && result.shopObservation?.dialogState !in setOf(
+            LabyrinthShopDialogState.PURCHASE_COMPLETE, LabyrinthShopDialogState.EXIT_CONFIRMATION) &&
+            result.shopObservation?.purchaseReceipt == null &&
+            now - lease.observedAt in 0..15_000L && lease.png.isNotEmpty() &&
+            lease.sessionId == activeSessionId && lease.accountId == activeRunAccountId &&
+            lease.enterId == validatedRoute?.enterId && lease.enterId == shoppingModule?.enterId &&
+            lease.nodeId == shoppingNodeId() && lease.floor == shoppingFloor() &&
+            shoppingModule?.verifiedBalance == lease.balance &&
+            shoppingFinancialEventIds(events) == lease.financialEventIds &&
+            (result.currencyObservation?.read == null || result.currencyObservation.balance == lease.balance)
+    }
+
+    private fun newShoppingLease(intentId: String?, price: Long, balance: Long, png: ByteArray, now: Long): ShoppingBudgetLease {
+        check(now - shoppingObservedFrameAt in 0..15_000L && png.isNotEmpty()) { "当帧预算证据已过期或原始PNG缺失" }
+        return ShoppingBudgetLease(intentId, price, balance, checkNotNull(shoppingNodeId()), checkNotNull(shoppingFloor()),
+            checkNotNull(shoppingModule?.enterId), activeRunAccountId, activeSessionId, shoppingObservedFrameAt,
+            png.copyOf(), shoppingFinancialEventIds(shoppingEvents()))
+    }
+
+    private fun invalidateShoppingLeases() {
+        shoppingPurchaseLease = null
+        if (shoppingRefreshEvidence?.prepared != true) shoppingRefreshEvidence = null
+    }
+
+    /** 弹窗和无receipt帧共用：幂等Room提交 → journal mark → 当前节点cycle计数。 */
+    private fun commitShoppingOwnership(sessionId: AutomationSessionId, ownership: PendingOwnership, now: Long): Boolean {
+        val module = checkNotNull(shoppingModule)
+        val commit = ownership.commit
+        check(commit.automated && !commit.ownershipCommitted) { "人工或已提交回执不可自动提交" }
+        val relics = if (commit.itemId == null) {
+            check(LabyrinthShopItemText.looksLikeRoleImprint(ownership.itemName)) { "空持有必须是精确印记" }
+            emptyList()
+        } else {
+            val relic = shoppingPurchaseCandidate?.takeIf { it.relicId == commit.itemId &&
+                it.displayName?.filterNot(Char::isWhitespace) == ownership.itemName }
+                ?: shoppingRelicResolver(commit.itemId) ?: shoppingRelicResolver(ownership.itemName)
+            check(relic?.relicId == commit.itemId && relic.displayName?.filterNot(Char::isWhitespace) == ownership.itemName &&
+                !relic.attribute.isNullOrBlank()) { "已保存回执无法按 ID 或唯一精确名称恢复遗物" }
+            listOf(checkNotNull(relic))
+        }
+        val store = checkNotNull(runStateStore) { "持有事务存储不可用" }
+        val accountId = activeRunAccountId
+        if (!beginGuardedAction()) return holdShopping("购买回执已保存，等待当前动作结束")
+        shoppingOwnershipInFlight.set(true)
+        launchGuardedAction {
+            try {
+                val snapshot = persistenceMutex.withLock {
+                    if (activeSessionId != sessionId) return@launchGuardedAction
+                    val saved = store.recordShopPurchase(accountId, commit.key, LabyrinthEntryPageState.SHOP_PURCHASE_COMPLETE.name, now, relics)
+                    module.markOwnershipCommitted(commit.key, now)
+                    saved
+                }
+                if (activeSessionId == sessionId) {
+                    shoppingError = null
+                    // 提交是在协程里完成的，记进展必须取提交完成时刻，不能用捕获的帧时间。
+                    noteShoppingProgress()
+                    _state.value = _state.value.copy(joinedCharacters = snapshot.joinedCharacters, observedRelics = snapshot.observedRelics)
+                    val events = module.events()
+                    val cycleStart = module.refreshCycleStart(shoppingNodeId(), shoppingFloor())
+                    val receiptSeq = events.single { shoppingEventId(it) == commit.key }["seq"]?.jsonPrimitive?.intOrNull ?: 0
+                    if (shoppingCountedReceipts.add(commit.key) && relics.isNotEmpty()) {
+                        if (ownership.nodeId == shoppingNodeId() && ownership.floor == shoppingFloor() && receiptSeq > cycleStart)
+                            shopRelicPurchasesThisCycle++
+                        relics.forEach(::advanceRelicStackCalibrationAfterAcquisition)
+                    }
+                    holdShopping("购买回执与持有已提交，等待安全关闭")
+                }
+            } catch (failure: Exception) {
+                if (activeSessionId == sessionId) holdShopping(failure.message ?: "持有提交失败", failure = true)
+            } finally {
+                shoppingOwnershipInFlight.set(false)
+            }
+        }
+        return holdShopping("购买回执已保存，等待持有事务提交")
+    }
+
+    /** 返回 true 表示本帧只允许保留购物界面，不可交给普通页面持久化或动画回退。 */
+    private fun handleShoppingFrame(
+        sessionId: AutomationSessionId,
+        result: LabyrinthEntryFrameResult,
+        now: Long,
+        encode: ((FileOutputStream) -> Boolean)?,
+    ): Boolean {
+        val module = shoppingModule ?: return false
+        shoppingObservedFrameAt = now
+        shoppingReadyReceiptKey = null
+        val shop = result.shopObservation
+        val receipt = shop?.purchaseReceipt
+        val shoppingPage = labyrinthPageUiOwner(result.observation.state) == LabyrinthPageUiOwner.SHOP || receipt != null
+        if (shoppingOwnershipInFlight.get()) return if (shoppingPage || result.observation.state in setOf(
+                LabyrinthEntryPageState.UNKNOWN, LabyrinthEntryPageState.GAME_LOADING_PROGRESS,
+                LabyrinthEntryPageState.PRE_HOME_DATA_LOADING)) holdShopping("购买回执已保存，等待持有事务提交") else false
+        try {
+            ensureShoppingRun(now)
+            if (shoppingConfirmDispatchedPending) {
+                module.confirmDispatched(clock())
+                shoppingConfirmDispatchedPending = false
+                shoppingConfirmationInFlight = false
+                shoppingPurchaseLease = null
+            }
+            shoppingRefreshEvidence?.let { evidence ->
+                evidence.confirmedAt?.let { confirmedAt ->
+                    module.refreshDispatched(evidence.attemptKey, confirmedAt)
+                    shoppingRefreshEvidence = null
+                }
+            }
+            if (shoppingPurchaseLease?.let { !shoppingLeaseValid(it, result, now) } == true) shoppingPurchaseLease = null
+            if (shoppingRefreshEvidence?.let { !it.prepared && !shoppingLeaseValid(it.lease, result, now) } == true)
+                shoppingRefreshEvidence = null
+            module.pendingOwnership().firstOrNull()?.let { return commitShoppingOwnership(sessionId, it, now) }
+            val events = shoppingEvents()
+            val pending = shoppingPendingIntent(events)
+            if (pending != null) {
+                val context = shoppingEventPayload(pending)
+                plannedShopPurchaseRelicId = context["item_id"]?.jsonPrimitive?.contentOrNull
+                plannedShopRoleImprintLabel = context["role_label"]?.jsonPrimitive?.contentOrNull
+                shopChoiceImprintRolePending = context["choice_imprint"]?.jsonPrimitive?.booleanOrNull == true
+                if (plannedShopPurchaseStartedAt == Long.MIN_VALUE) plannedShopPurchaseStartedAt = now
+            }
+            shop?.purchaseCandidate?.takeIf { it.relicId != null && it.relicId == plannedShopPurchaseRelicId }
+                ?.let { shoppingPurchaseCandidate = it }
+            if (receipt != null || shop?.dialogState == LabyrinthShopDialogState.PURCHASE_COMPLETE ||
+                result.observation.state == LabyrinthEntryPageState.SHOP_PURCHASE_COMPLETE) {
+                if (receipt == null || !receipt.verified) {
+                    return holdShopping("等待购买财务回执独立双读核实：${receipt?.reviewReason ?: "回执正在读取"}")
+                }
+                val commit = module.acceptReceipt(receipt, shoppingNodeId(), shoppingFloor(), now,
+                    checkNotNull(encode) { "原始回执帧已不可用" })
+                if (!commit.automated) {
+                    shoppingError = null
+                    return holdShopping("人工购买回执已记账，弹窗保持人工控制")
+                }
+                if (shoppingDismissedReceiptKey == commit.key) return holdShopping("购买完成已关闭，等待弹窗退场")
+                if (!commit.ownershipCommitted) {
+                    val ownership = module.pendingOwnership().single { it.commit.key == commit.key }
+                    return commitShoppingOwnership(sessionId, ownership, now)
+                }
+                if (shoppingCountedReceipts.add(commit.key) && commit.itemId != null) shopRelicPurchasesThisCycle++
+                shoppingError = null
+                if (!module.canDismiss(receipt)) return holdShopping("购买持有尚未核实，不关闭弹窗")
+                shoppingReadyReceiptKey = commit.key
+                noteShoppingProgress(now)
+                return false
+            }
+            if (unsettledShoppingOwnership(events) && (shoppingPage || result.observation.state in setOf(
+                    LabyrinthEntryPageState.UNKNOWN, LabyrinthEntryPageState.GAME_LOADING_PROGRESS,
+                    LabyrinthEntryPageState.PRE_HOME_DATA_LOADING))) {
+                return holdShopping("已保存购买回执等待持有提交；保留弹窗，不推进其他商品")
+            }
+            val confirmationUnknown = pending != null && events.any { event ->
+                shoppingEventPayload(event)["intent_id"] == pending["event_id"] &&
+                    (shoppingEventType(event) == "shop.purchase_confirm_dispatched" ||
+                        (shoppingEventType(event) == "shop.purchase_confirm_prepared" && events.none {
+                            shoppingEventType(it) == "shop.purchase_confirm_rejected" &&
+                                shoppingEventPayload(it)["prepared_id"] == event["event_id"] }))
+            }
+            if (pending != null && (shoppingPage || result.observation.state in setOf(
+                    LabyrinthEntryPageState.UNKNOWN, LabyrinthEntryPageState.GAME_LOADING_PROGRESS,
+                    LabyrinthEntryPageState.PRE_HOME_DATA_LOADING))) {
+                if (confirmationUnknown || shoppingConfirmationInFlight) return holdShopping("购买确认结果未知或已派发，等待精确财务回执；不重复确认")
+                if (shoppingPurchaseLease == null) return holdShopping("购买预算证据已失效或重启丢失，确认保持人工控制")
+                if (shop?.dialogState != LabyrinthShopDialogState.PURCHASE_CONFIRMATION &&
+                    result.observation.state != LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION) {
+                    return holdShopping("购买意图已保存，等待同一商品确认弹窗；禁止新购")
+                }
+            }
+            val refresh = unresolvedShoppingRefresh()
+            val cycleBefore = module.refreshCycleStart(shoppingNodeId(), shoppingFloor())
+            if (pending == null && result.currencyObservation?.balance != null) {
+                module.observeBalance(result.currencyObservation, shoppingNodeId(), shoppingFloor(), now,
+                    checkNotNull(encode) { "原始余额帧已不可用" })
+            }
+            if (refresh != null) {
+                shopRefreshesThisVisit = module.refreshCount(shoppingNodeId(), shoppingFloor())
+                if (unresolvedShoppingRefresh() != null) return holdShopping("刷新结果未决，等待同节点严格扣费证据；禁止购买、刷新或退出")
+                if (module.refreshCycleStart(shoppingNodeId(), shoppingFloor()) > cycleBefore) {
+                    shopRelicPurchasesThisCycle = 0
+                    clearPlannedShopRefresh()
+                }
+            }
+            shoppingError = null
+            return false
+        } catch (failure: Exception) {
+            holdShopping(failure.message ?: "购物持久化失败", failure = true)
+            // 非购物页面照常运行；购买完成和确认弹窗绝不泄露到普通持久化/回退链。
+            return shoppingPage ||
+                shoppingConfirmDispatchedPending || shoppingRefreshEvidence?.confirmedAt != null ||
+                ((plannedShopPurchaseRelicId != null || plannedShopRoleImprintLabel != null ||
+                    plannedShopRefreshStartedAt != Long.MIN_VALUE) && result.observation.state in setOf(
+                    LabyrinthEntryPageState.UNKNOWN, LabyrinthEntryPageState.GAME_LOADING_PROGRESS,
+                    LabyrinthEntryPageState.PRE_HOME_DATA_LOADING))
+        }
+    }
+
+    private fun resetShoppingSession() {
+        shoppingModule?.reset()
+        shoppingRunInitialized = false
+        shoppingRunAccountId = null
+        shoppingRunBatchId = null
+        shoppingObservedFrameAt = Long.MIN_VALUE
+        shoppingPurchaseLease = null
+        shoppingConfirmationInFlight = false
+        shoppingPurchaseCandidate = null
+        shoppingRefreshEvidence = null
+        shoppingConfirmDispatchedPending = false
+        shoppingError = null
+        shoppingDismissedReceiptKey = null
+        shoppingReadyReceiptKey = null
+        shoppingCountedReceipts.clear()
+        shoppingLastProgressAt = Long.MIN_VALUE
+        shoppingHoldPage = null
+        shoppingTransitionGranted = false
+        shoppingRejectionsInStreak = 0
+        pendingShoppingStop.set(null)
+    }
+
     private fun persistObservation(
         sessionId: AutomationSessionId,
         result: LabyrinthEntryFrameResult,
@@ -3094,7 +3602,7 @@ class LabyrinthEntryRecognitionSession(
             return
         }
         val shopDialogState = result.shopObservation?.dialogState
-        val purchasedRelic = when (shopDialogState) {
+        val purchasedRelic = if (shoppingModule != null) null else when (shopDialogState) {
             LabyrinthShopDialogState.PURCHASE_CONFIRMATION -> {
                 // Only a transaction explicitly planned as a relic is eligible for relic
                 // persistence. Role-imprint icons can resemble relic templates and must never be
@@ -3292,6 +3800,7 @@ class LabyrinthEntryRecognitionSession(
         lastObservedPageState = pageState
 
         if (
+            shoppingModule == null &&
             pageState == LabyrinthEntryPageState.SHOP_PURCHASE_COMPLETE &&
             plannedShopPurchaseRelicId != null &&
             !plannedShopPurchaseCounted
@@ -3337,7 +3846,7 @@ class LabyrinthEntryRecognitionSession(
             _state.value = _state.value.copy(eventChoiceDecision = null)
             resetEventChoiceCommit()
         }
-        if (labyrinthPageUiOwner(pageState) != LabyrinthPageUiOwner.SHOP) {
+        if (shoppingModule == null && labyrinthPageUiOwner(pageState) != LabyrinthPageUiOwner.SHOP) {
             pendingShopPurchase = null
             val keepPurchaseTransition = labyrinthKeepsPlannedShopPurchaseAcrossPage(
                 pageState = pageState,
@@ -4208,6 +4717,25 @@ class LabyrinthEntryRecognitionSession(
     private fun currentShopDecision(result: LabyrinthEntryFrameResult): LabyrinthShopDecision? {
         val shop = result.shopObservation ?: return null
         if (shop.dialogState != LabyrinthShopDialogState.NONE) return null
+        var shoppingBalance: Long? = null
+        if (shoppingModule != null) {
+            shoppingError?.let { return LabyrinthShopDecision.Wait(it) }
+            try {
+                if (!shoppingModule.active || shoppingModule.enterId != validatedRoute?.enterId) return LabyrinthShopDecision.Wait("实际 enter 未核实，自动购物已禁用")
+                val events = shoppingEvents()
+                if (shoppingPendingIntent(events) != null || unresolvedShoppingRefresh() != null ||
+                    unsettledShoppingOwnership(events) || shoppingRefreshEvidence != null || shoppingConfirmDispatchedPending) {
+                    return LabyrinthShopDecision.Wait("已有购物操作等待确认或对账，禁止新购")
+                }
+                val balance = result.currencyObservation?.balance
+                if (balance != null && shoppingModule.verifiedBalance == balance) shoppingBalance = balance
+                // 未核实金额交给预算分支等待；区域4/关闭购买仍先走原策略的无消费退出判据。
+                if (shop.priceReviewReason != null && shoppingBalance != null) shoppingBalance = null
+            } catch (failure: Exception) {
+                holdShopping(failure.message ?: "购物账本读取失败", failure = true)
+                return LabyrinthShopDecision.Wait(checkNotNull(shoppingError))
+            }
+        }
         val refreshAnchorReady = result.anchorMatches[EntryAnchorId.SHOP_REFRESH_BUTTON]
             ?.score
             ?.let { it >= POST_ENTRY_ANCHOR_MIN_SCORE }
@@ -4225,6 +4753,8 @@ class LabyrinthEntryRecognitionSession(
             relicPurchasesInCycle = shopRelicPurchasesThisCycle,
             refreshAvailabilityKnown = refreshAnchorReady,
             refreshesUsedInVisit = shopRefreshesThisVisit,
+            verifiedBalance = shoppingBalance,
+            verifiedRefreshPrice = if (shoppingModule != null) shop.verifiedRefreshPrice else null,
         )
     }
 
@@ -4995,8 +5525,9 @@ class LabyrinthEntryRecognitionSession(
      * a long coroutine body, and a latch held implausibly long is treated as a fault by
      * [labyrinthActionLatchStuck] instead of being waited on.
      */
-    private fun beginGuardedAction(): Boolean {
+    private fun beginGuardedAction(preserveShoppingLease: Boolean = false): Boolean {
         if (!actionInFlight.compareAndSet(false, true)) return false
+        if (!preserveShoppingLease) invalidateShoppingLeases()
         actionInFlightSince = clock()
         return true
     }
@@ -5004,6 +5535,49 @@ class LabyrinthEntryRecognitionSession(
     private fun endGuardedAction() {
         actionInFlightSince = Long.MIN_VALUE
         actionInFlight.set(false)
+        // 购物期限到期时可能正卡在动作里（例如手势被反复拒绝），停止请求在这里补发。
+        flushShoppingStop()
+    }
+
+    /**
+     * 购物等待到期后的停止请求。
+     *
+     * holdShopping 既会在帧线程调用（锁空闲，可以立即停），也会在动作协程里调用（锁被自己占着，
+     * 此时 beginGuardedAction 必然失败）。请求先落在这个槽里，等动作 finally 释放锁后再停，
+     * 不会因为调用点不同而丢掉停止；带上发起时的 sessionId，避免旧会话的请求停掉新会话。
+     * [requireExpiry] 表示这是时间期限触发的请求，执行前要复核期限（中途落地的进展可以撤销它）；
+     * 拒绝预算触发的请求不按时间判断。
+     */
+    private data class PendingShoppingStop(
+        val sessionId: AutomationSessionId,
+        val reason: String,
+        val requireExpiry: Boolean,
+    )
+
+    private val pendingShoppingStop = AtomicReference<PendingShoppingStop?>(null)
+
+    private fun requestShoppingStop(reason: String, requireExpiry: Boolean = true) {
+        val sessionId = activeSessionId ?: return
+        pendingShoppingStop.set(PendingShoppingStop(sessionId, reason, requireExpiry))
+        flushShoppingStop()
+    }
+
+    private fun flushShoppingStop() {
+        val pending = pendingShoppingStop.get() ?: return
+        if (activeSessionId != pending.sessionId) {
+            pendingShoppingStop.compareAndSet(pending, null)
+            return
+        }
+        // 到期之后可能已经有真实进展（手势落地、回执入账）；真正停之前必须复核期限。
+        if (pending.requireExpiry && (shoppingLastProgressAt == Long.MIN_VALUE ||
+                !labyrinthShoppingHoldExpired(clock() - shoppingLastProgressAt))
+        ) {
+            pendingShoppingStop.compareAndSet(pending, null)
+            return
+        }
+        if (!beginGuardedAction()) return
+        pendingShoppingStop.compareAndSet(pending, null)
+        launchGuardedAction { if (activeSessionId == pending.sessionId) stopFromRunLogic(pending.reason) }
     }
 
     /** Runs a dispatched action, releasing the latch however the body ends. */
@@ -5371,6 +5945,13 @@ class LabyrinthEntryRecognitionSession(
             return
         }
         if (postEntryAttempts >= maxAttempts) {
+            if (shoppingModule != null && labyrinthPageUiOwner(pageState) == LabyrinthPageUiOwner.SHOP) {
+                holdShopping(
+                    shoppingError ?: "购物点击达到安全上限，保留弹窗等待复核；" +
+                        "连续${SHOPPING_HOLD_TIMEOUT_MILLIS / 1000}秒无进展将停止并保留诊断",
+                )
+                return
+            }
             val reason = if (characterAcquisitionActive) {
                 "角色获得动画推进达到上限，已停止并保留诊断状态"
             } else if (finalAnimationActive && finalAnimationPage) {
@@ -5755,8 +6336,8 @@ class LabyrinthEntryRecognitionSession(
                         shopWaitReason = "未检测到程序发起的购买，本次确认弹窗保持人工控制"
                         null
                     }
-                    plannedShopPurchaseStartedAt == Long.MIN_VALUE ||
-                        timestampMillis - plannedShopPurchaseStartedAt > SHOP_PURCHASE_TRANSITION_TIMEOUT_MILLIS -> {
+                    shoppingModule == null && (plannedShopPurchaseStartedAt == Long.MIN_VALUE ||
+                        timestampMillis - plannedShopPurchaseStartedAt > SHOP_PURCHASE_TRANSITION_TIMEOUT_MILLIS) -> {
                         clearPlannedShopPurchase()
                         shopWaitReason = "程序发起的购买确认已超时，本次弹窗保持人工控制"
                         null
@@ -5805,7 +6386,13 @@ class LabyrinthEntryRecognitionSession(
             }
 
             LabyrinthEntryPageState.SHOP_PURCHASE_COMPLETE ->
-                if (plannedShopPurchaseRelicId != null || plannedShopRoleImprintLabel != null) {
+                if (shoppingModule != null && shoppingReadyReceiptKey != null && result.shopObservation?.purchaseReceipt?.verified == true) {
+                    LabyrinthPostEntryTapPlan(
+                        LabyrinthPostEntryActionKind.SHOP_CLOSE_PURCHASE_COMPLETE,
+                        "关闭已入账购买完成",
+                        checkNotNull(result.shopObservation.purchaseReceipt?.confirmRect),
+                    )
+                } else if (shoppingModule == null && (plannedShopPurchaseRelicId != null || plannedShopRoleImprintLabel != null)) {
                     // Purchase-complete is a single-button standard modal; dismissing it returns
                     // to SHOP, where all visible slots are recognized again. This is what makes
                     // the game-side "后面的商品补位" naturally enter the next decision cycle.
@@ -5925,6 +6512,13 @@ class LabyrinthEntryRecognitionSession(
                     labyrinthPageStallExpired(
                         stalledMillis = timestampMillis - postEntryStallSince,
                         battlePage = pageState == LabyrinthEntryPageState.BATTLE_IN_PROGRESS,
+                        // 购物页只是把期限放宽到自己的预算，而不是完全豁免：没有这一步，
+                        // 一个不产生任何 hold 的商店页同样能把无人值守批跑无限挂住。
+                        limitMillis = if (shoppingModule != null && labyrinthPageUiOwner(pageState) == LabyrinthPageUiOwner.SHOP) {
+                            SHOPPING_HOLD_TIMEOUT_MILLIS
+                        } else {
+                            POST_ENTRY_STALL_TIMEOUT_MILLIS
+                        },
                     )
                 ) {
                     finishFromPlanner(
@@ -6999,6 +7593,156 @@ class LabyrinthEntryRecognitionSession(
         }
     }
 
+    private fun shoppingActionKind(kind: LabyrinthPostEntryActionKind): Boolean = kind in setOf(
+        LabyrinthPostEntryActionKind.SHOP_BUY_RELIC, LabyrinthPostEntryActionKind.SHOP_BUY_IMPRINT,
+        LabyrinthPostEntryActionKind.SHOP_CONFIRM_RELIC, LabyrinthPostEntryActionKind.SHOP_CONFIRM_IMPRINT,
+        LabyrinthPostEntryActionKind.SHOP_CLOSE_PURCHASE_COMPLETE, LabyrinthPostEntryActionKind.SHOP_REFRESH,
+        LabyrinthPostEntryActionKind.SHOP_CONFIRM_REFRESH, LabyrinthPostEntryActionKind.SHOP_CLOSE,
+        LabyrinthPostEntryActionKind.SHOP_CONFIRM_EXIT,
+    )
+
+    /** 所有购物点击在此复核；购买意图必须在真实手势之前耐久保存。 */
+    private fun prepareShoppingAction(
+        kind: LabyrinthPostEntryActionKind,
+        now: Long,
+        targetRect: EntryPixelRect?,
+        relicId: String?,
+        imprintLabel: String?,
+    ): Boolean {
+        val module = shoppingModule ?: return true
+        if (kind !in setOf(LabyrinthPostEntryActionKind.SHOP_CONFIRM_RELIC, LabyrinthPostEntryActionKind.SHOP_CONFIRM_IMPRINT,
+                LabyrinthPostEntryActionKind.SHOP_CONFIRM_REFRESH)) invalidateShoppingLeases()
+        if (!shoppingActionKind(kind)) return true
+        try {
+            ensureShoppingRun(now)
+            check(shoppingError == null && !shoppingOwnershipInFlight.get() && !shoppingConfirmDispatchedPending && !shoppingConfirmationInFlight) {
+                shoppingError ?: "购物持有或确认派发尚待提交"
+            }
+            val result = checkNotNull(_state.value.lastResult) { "购物动作没有当帧识别结果" }
+            if (kind == LabyrinthPostEntryActionKind.SHOP_CONFIRM_REFRESH) {
+                val events = shoppingEvents()
+                check(shoppingPendingIntent(events) == null && unresolvedShoppingRefresh() == null) { "已有购物操作待对账" }
+                val evidence = checkNotNull(shoppingRefreshEvidence) { "刷新前原图与预算已丢失，不能确认" }
+                check(evidence.confirmedAt == null && shoppingLeaseValid(evidence.lease, result, now)) { "刷新预算证据已过期、页面或节点发生变化" }
+                result.currencyObservation?.balance?.let { check(it == evidence.balance) { "刷新确认前余额发生变化" } }
+                result.shopObservation?.verifiedRefreshPrice?.let { check(it == evidence.price) { "刷新确认前价格发生变化" } }
+                check(module.verifiedBalance == evidence.balance) { "刷新前余额尚未对账" }
+                if (!module.prepareRefresh(evidence.attemptKey, evidence.priceRead, evidence.balanceObservation,
+                        evidence.nodeId, evidence.floor, now) { it.write(evidence.png); true }) {
+                    holdShopping("刷新已 prepared，仅等待严格扣费证据")
+                    return false
+                }
+                evidence.prepared = true
+                shopRefreshesThisVisit = module.refreshCount(evidence.nodeId, evidence.floor)
+                // prepared 只是「准备点击」，手势被确定拒绝时会被撤回，不算进展。
+                return true
+            }
+            val shop = checkNotNull(result.shopObservation) { "购物动作没有当帧商店观测" }
+            if (kind == LabyrinthPostEntryActionKind.SHOP_CLOSE_PURCHASE_COMPLETE) {
+                val receipt = checkNotNull(shop.purchaseReceipt) { "购买财务回执尚未核实" }
+                check(shoppingReadyReceiptKey != null && shoppingDismissedReceiptKey != shoppingReadyReceiptKey && module.canDismiss(receipt)) {
+                    "购买账本与持有提交未全部完成，禁止关闭"
+                }
+                // 关闭也要真的落地才算进展；被确定拒绝时同样受拒绝预算约束。
+                return true
+            }
+            val events = shoppingEvents()
+            val pending = shoppingPendingIntent(events)
+            if (kind == LabyrinthPostEntryActionKind.SHOP_CONFIRM_RELIC || kind == LabyrinthPostEntryActionKind.SHOP_CONFIRM_IMPRINT) {
+                check(pending != null) { "没有耐久购买意图，确认弹窗保持人工控制" }
+                check(events.none { shoppingEventType(it) == "shop.purchase_confirm_dispatched" &&
+                    shoppingEventPayload(it)["intent_id"] == pending["event_id"] }) { "购买已确认，等待财务回执，不重复确认" }
+                check(module.evidenceValid(pending)) { "购买意图原图失效" }
+                val context = shoppingEventPayload(pending)
+                // 重启后预算证据只在内存里，丢了就不自动确认：确认页无法重新双读金额，
+                // 拿耐久意图去点等于用过期价格下单。这里等的是人工，hold 到期限会停止整局。
+                val lease = checkNotNull(shoppingPurchaseLease) {
+                    "确认页缺少预算证据（会话重启会丢失），不自动确认；请人工处理或等待超时停止"
+                }
+                check(lease.intentId == shoppingEventId(pending) && shoppingLeaseValid(lease, result, now) &&
+                    lease.balance == context["expected_balance_before"]?.jsonPrimitive?.longOrNull &&
+                    lease.price == context["expected_spent"]?.jsonPrimitive?.longOrNull) { "购买预算证据已过期或上下文改变" }
+                check(result.observation.state == LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION &&
+                    shop.dialogState == LabyrinthShopDialogState.PURCHASE_CONFIRMATION) { "不是同一购买确认页" }
+                check(module.verifiedBalance == lease.balance) { "确认时耐久核实余额与意图不一致" }
+                shop.items.takeIf { it.isNotEmpty() }?.let { items ->
+                    val currentItem = items.single { it.slotId == context["slot_id"]?.jsonPrimitive?.contentOrNull }
+                    check(currentItem.verifiedPrice == lease.price &&
+                        (currentItem.relicMatch?.displayName ?: currentItem.titleText)?.filterNot(Char::isWhitespace) ==
+                        context["item_name"]?.jsonPrimitive?.contentOrNull) { "确认页当前价格或商品与意图不一致" }
+                }
+                check(pending["node_id"]?.jsonPrimitive?.longOrNull == shoppingNodeId() &&
+                    pending["floor"]?.jsonPrimitive?.intOrNull == shoppingFloor()) { "购买确认节点发生变化" }
+                result.currencyObservation?.balance?.let { balance ->
+                    check(balance == context["expected_balance_before"]?.jsonPrimitive?.longOrNull) { "确认前实时余额与意图不符" }
+                }
+                if (kind == LabyrinthPostEntryActionKind.SHOP_CONFIRM_RELIC) {
+                    val candidate = checkNotNull(shop.purchaseCandidate) { "确认遗物尚未核实" }
+                    check(candidate.recognized && relicId == candidate.relicId &&
+                        candidate.relicId == context["item_id"]?.jsonPrimitive?.contentOrNull &&
+                        candidate.displayName?.filterNot(Char::isWhitespace) == context["item_name"]?.jsonPrimitive?.contentOrNull) {
+                        "确认遗物精确身份与意图不符"
+                    }
+                    shoppingPurchaseCandidate = candidate
+                } else check(!imprintLabel.isNullOrBlank() && imprintLabel == context["role_label"]?.jsonPrimitive?.contentOrNull &&
+                    context["item_id"]?.jsonPrimitive?.contentOrNull == null &&
+                    context["item_kind"]?.jsonPrimitive?.contentOrNull == "role_imprint" &&
+                    LabyrinthShopItemText.roleImprintLabel(context["item_name"]?.jsonPrimitive?.contentOrNull) == imprintLabel &&
+                    LabyrinthShopItemText.isChoiceRoleImprint(context["item_name"]?.jsonPrimitive?.contentOrNull) ==
+                    context["choice_imprint"]?.jsonPrimitive?.booleanOrNull) { "印记确认身份不符" }
+                if (!module.prepareConfirmation(now)) {
+                    holdShopping("购买确认已prepared或已派发，仅等待精确回执")
+                    return false
+                }
+                shoppingConfirmationInFlight = true
+                // prepared 只是「准备点击」，手势被确定拒绝时会被撤回，不算进展。
+                return true
+            }
+            check(pending == null && unresolvedShoppingRefresh() == null && !unsettledShoppingOwnership(events)) {
+                "已有购物操作待对账，禁止新购或退出"
+            }
+            if (kind == LabyrinthPostEntryActionKind.SHOP_BUY_RELIC || kind == LabyrinthPostEntryActionKind.SHOP_BUY_IMPRINT) {
+                val decision = currentShopDecision(result)
+                val item = when (decision) {
+                    is LabyrinthShopDecision.BuyRelic -> decision.item.takeIf { kind == LabyrinthPostEntryActionKind.SHOP_BUY_RELIC }
+                    is LabyrinthShopDecision.BuyRoleImprint -> decision.item.takeIf { kind == LabyrinthPostEntryActionKind.SHOP_BUY_IMPRINT }
+                    else -> null
+                }
+                check(item != null) { "实时商品预算未许可购买" }
+                check(targetRect == item.buyButtonRect && when (kind) {
+                    LabyrinthPostEntryActionKind.SHOP_BUY_RELIC -> relicId != null && relicId == item.relicMatch?.relicId
+                    else -> imprintLabel != null && imprintLabel == item.roleImprintLabel
+                }) { "当帧预算商品与实际购买按钮或身份不一致" }
+                val balance = checkNotNull(result.currencyObservation?.balance) { "当帧余额尚未核实" }
+                check(module.verifiedBalance == balance && shop.priceReviewReason == null) { "价格或余额尚待对账" }
+                check(result.observation.state == LabyrinthEntryPageState.SHOP) { "预算证据必须来自当帧商品页" }
+                val png = checkNotNull(shoppingFramePng) { "购买原始PNG已不可用" }.invoke()
+                val lease = newShoppingLease(null, checkNotNull(item.verifiedPrice), balance, png, now)
+                val intentId = module.recordIntent(item, balance, shoppingNodeId(), shoppingFloor(), now,
+                    checkNotNull(shoppingFrameEncoder) { "购买原始帧已不可用" })
+                shoppingPurchaseLease = lease.copy(intentId = intentId)
+                shoppingPurchaseCandidate = item.relicMatch
+                // 意图只是「准备点击」，被确定拒绝时会被取消，不算进展。
+                return true
+            }
+            if (kind == LabyrinthPostEntryActionKind.SHOP_REFRESH) {
+                check(currentShopDecision(result) is LabyrinthShopDecision.Refresh) { "实时刷新预算未许可" }
+                val balance = checkNotNull(result.currencyObservation?.balance) { "刷新前余额尚未核实" }
+                val price = checkNotNull(shop.verifiedRefreshPrice) { "实际刷新价格尚未核实" }
+                check(shop.priceReviewReason == null && module.verifiedBalance == balance && balance >= price) { "刷新价格或余额未核实" }
+                check(result.observation.state == LabyrinthEntryPageState.SHOP) { "刷新预算证据必须来自当帧商品页" }
+                shoppingRefreshEvidence = ShoppingRefreshEvidence(newShoppingLease(null, price, balance,
+                    checkNotNull(shoppingFramePng) { "刷新原始帧已不可用" }.invoke(), now),
+                    checkNotNull(shop.refreshPriceRead), checkNotNull(result.currencyObservation))
+                // 预算证据同样只是「准备点击」，被确定拒绝时会清空，不算进展。
+            }
+            return true
+        } catch (failure: Exception) {
+            holdShopping(failure.message ?: "购物动作准备失败", failure = true)
+            return false
+        }
+    }
+
     private fun dispatchPostEntryTap(
         sessionId: AutomationSessionId,
         kind: LabyrinthPostEntryActionKind,
@@ -7013,7 +7757,12 @@ class LabyrinthEntryRecognitionSession(
         eventFreeRoleConfirm: Boolean = false,
         eventFreeRoleConfirmIds: List<String> = emptyList(),
     ) {
-        if (!beginGuardedAction()) return
+        if (!beginGuardedAction(preserveShoppingLease = shoppingActionKind(kind))) return
+        if (!prepareShoppingAction(kind, timestampMillis, rect, shopPurchaseRelicId, shopPurchaseRoleImprintLabel)) {
+            endGuardedAction()
+            return
+        }
+        val refreshConfirmationEvidence = shoppingRefreshEvidence.takeIf { kind == LabyrinthPostEntryActionKind.SHOP_CONFIRM_REFRESH }
         val selectedReward = (_state.value.roleRewardChoiceDecision as? LabyrinthRoleRewardChoiceDecision.Select)
             ?.takeIf { it.characterId == roleRewardSelectedCharacterId && it.actionSafe }
         val selectedRewardAccountId = activeRunAccountId
@@ -7046,13 +7795,94 @@ class LabyrinthEntryRecognitionSession(
                     y = rect.top + rect.height / 2f,
                 ),
             )
-            val actionResult = if (executor == null) {
-                AutomationActionResult.Rejected(tap, "动作执行器不可用")
-            } else {
-                executor.execute(sessionId, tap)
+            val module = shoppingModule
+            val actionResult = try {
+                if (executor == null) AutomationActionResult.Rejected(tap, "动作执行器不可用")
+                else executor.execute(sessionId, tap)
+            } catch (failure: Exception) {
+                if (module == null || !shoppingActionKind(kind)) throw failure
+                // executor异常无法证明手势未执行；保留prepared，绝不reject或释放购买意图。
+                shoppingConfirmationInFlight = false
+                holdShopping(failure.message ?: "购物执行结果未知，仅等待精确回执", failure = true)
+                return@launchGuardedAction
+            }
+            if (module != null && shoppingActionKind(kind) && actionResult !is AutomationActionResult.Executed &&
+                activeSessionId == sessionId) {
+                try {
+                    if (kind == LabyrinthPostEntryActionKind.SHOP_CONFIRM_RELIC || kind == LabyrinthPostEntryActionKind.SHOP_CONFIRM_IMPRINT) {
+                        module.rejectConfirmation(clock())
+                        shoppingConfirmationInFlight = false
+                    }
+                    if (kind == LabyrinthPostEntryActionKind.SHOP_BUY_RELIC || kind == LabyrinthPostEntryActionKind.SHOP_BUY_IMPRINT) {
+                        module.cancelIntent(clock())
+                        clearPlannedShopPurchase()
+                        shoppingPurchaseCandidate = null
+                        shoppingPurchaseLease = null
+                    }
+                    if (kind == LabyrinthPostEntryActionKind.SHOP_CONFIRM_REFRESH) {
+                        val evidence = checkNotNull(refreshConfirmationEvidence)
+                        module.rejectRefresh(evidence.attemptKey, clock())
+                        shopRefreshesThisVisit = module.refreshCount(evidence.nodeId, evidence.floor)
+                        shoppingRefreshEvidence = null
+                        clearPlannedShopRefresh()
+                    }
+                    if (kind == LabyrinthPostEntryActionKind.SHOP_REFRESH) shoppingRefreshEvidence = null
+                    shoppingError = null
+                    postEntryAttempts = (postEntryAttempts - 1).coerceAtLeast(0)
+                    val reason = (actionResult as? AutomationActionResult.Rejected)?.reason ?: actionResult.toString()
+                    // 只统计「手势真的被拒」；Paused/StaleSession/DryRun 和游戏不在前台属于环境状态，
+                    // 它们有自己的等待与恢复路径，不该被当成点不动而提前停止。
+                    val gestureRejected = actionResult is AutomationActionResult.Rejected &&
+                        reason != GAME_NOT_FOREGROUND_REASON
+                    if (gestureRejected) {
+                        // 每次重试都会写一条意图和一张整帧 PNG，拒绝不会删已落盘的证据；连续被拒
+                        // 先停，不等 180 秒的期限，避免为一次卡死留下上百张整帧图。
+                        shoppingRejectionsInStreak++
+                        if (shoppingRejectionsInStreak >= SHOPPING_REJECTION_BUDGET) {
+                            requestShoppingStop(
+                                "购物手势连续${shoppingRejectionsInStreak}次被确定拒绝（$reason）；已停止并保留诊断状态",
+                                requireExpiry = false,
+                            )
+                            return@launchGuardedAction
+                        }
+                    }
+                    if (reason == GAME_NOT_FOREGROUND_REASON) publishWaitingForGameForeground(sessionId)
+                    else holdShopping("购物点击确定未执行，可重试：$reason")
+                } catch (failure: Exception) {
+                    shoppingConfirmationInFlight = false
+                    holdShopping(failure.message ?: "购物确定拒绝保存失败", failure = true)
+                }
+                return@launchGuardedAction
             }
             when (actionResult) {
                 is AutomationActionResult.Executed -> {
+                    if (activeSessionId != sessionId) return@launchGuardedAction
+                    if (module != null && shoppingActionKind(kind)) {
+                        try {
+                            if (kind == LabyrinthPostEntryActionKind.SHOP_CONFIRM_RELIC || kind == LabyrinthPostEntryActionKind.SHOP_CONFIRM_IMPRINT) {
+                                shoppingConfirmDispatchedPending = true
+                                module.confirmDispatched(clock())
+                                shoppingConfirmDispatchedPending = false
+                                shoppingConfirmationInFlight = false
+                                shoppingPurchaseLease = null
+                            }
+                            if (kind == LabyrinthPostEntryActionKind.SHOP_CONFIRM_REFRESH) {
+                                val evidence = checkNotNull(refreshConfirmationEvidence) { "刷新原始证据已丢失" }
+                                val confirmedAt = clock()
+                                evidence.confirmedAt = confirmedAt
+                                shoppingRefreshEvidence = evidence
+                                module.refreshDispatched(evidence.attemptKey, confirmedAt)
+                                shoppingRefreshEvidence = null
+                                shopRefreshesThisVisit = module.refreshCount(evidence.nodeId, evidence.floor)
+                            }
+                        } catch (failure: Exception) {
+                            holdShopping(failure.message ?: "购物动作提交失败", failure = true)
+                            return@launchGuardedAction
+                        }
+                        // 只有真的落地的手势才算购物进展：意图与 prepared 都可能被确定拒绝撤回，
+                        // 拿它们当进展会让「点不动」的重试循环永远触发不了期限。
+                        noteShoppingProgress(clock())
+                    }
                     lastPostEntryActionLandedAt = clock()
                     if (kind == LabyrinthPostEntryActionKind.EVENT_FREE_ROLE_SELECT && eventFreeRoleCandidateId != null) {
                         eventFreeRoleSelectedCharacterIds += eventFreeRoleCandidateId
@@ -7179,12 +8009,26 @@ class LabyrinthEntryRecognitionSession(
                             postEntryStableFrames = 0
                             postEntryAttempts = 0
                         }
-                        LabyrinthPostEntryActionKind.SHOP_CLOSE_PURCHASE_COMPLETE -> clearPlannedShopPurchase()
+                        LabyrinthPostEntryActionKind.SHOP_CLOSE_PURCHASE_COMPLETE -> {
+                            if (shoppingModule != null) {
+                                shoppingDismissedReceiptKey = shoppingReadyReceiptKey
+                                shoppingReadyReceiptKey = null
+                                shoppingPurchaseCandidate = null
+                                pendingShopPurchase = null
+                                val result = _state.value.lastResult
+                                _state.value = _state.value.copy(lastResult = result?.copy(
+                                    currencyObservation = null,
+                                    shopObservation = result.shopObservation?.copy(items = emptyList(), purchaseCandidate = null,
+                                        refreshPriceRead = null, priceReviewReason = null),
+                                ))
+                            }
+                            clearPlannedShopPurchase()
+                        }
                         LabyrinthPostEntryActionKind.SHOP_REFRESH -> {
                             // The refresh button opens a second confirmation dialog.  Keep the
                             // completed-cycle count until that dialog is confirmed and fresh shop
                             // stock is visible again.
-                            shopRefreshesThisVisit++
+                            if (shoppingModule == null) shopRefreshesThisVisit++
                             plannedShopRefreshStartedAt = clock()
                             plannedShopRefreshConfirmedAt = Long.MIN_VALUE
                             postEntryStableFrames = 0
@@ -7192,7 +8036,7 @@ class LabyrinthEntryRecognitionSession(
                             clearPlannedShopPurchase()
                         }
                         LabyrinthPostEntryActionKind.SHOP_CONFIRM_REFRESH -> {
-                            plannedShopRefreshConfirmedAt = clock()
+                            if (shoppingModule == null || shoppingModule.pendingRefresh() != null) plannedShopRefreshConfirmedAt = clock()
                             postEntryStableFrames = 0
                             postEntryAttempts = 0
                         }
@@ -7282,6 +8126,7 @@ class LabyrinthEntryRecognitionSession(
     }
 
     private fun resetNodeExecutionState() {
+        resetShoppingSession()
         battleWait.reset()
         eventFreeRoleSelectedCharacterIds.clear()
         eventFreeRoleLastSelectAt = Long.MIN_VALUE
@@ -8085,7 +8930,7 @@ class LabyrinthEntryRecognitionSession(
         if (startedAt == Long.MIN_VALUE) return false
 
         val elapsed = (timestampMillis - startedAt).coerceAtLeast(0L)
-        if (elapsed > SHOP_REFRESH_TRANSITION_TIMEOUT_MILLIS) {
+        if (shoppingModule == null && elapsed > SHOP_REFRESH_TRANSITION_TIMEOUT_MILLIS) {
             clearPlannedShopRefresh()
             if (activeSessionId == sessionId) {
                 _state.value = _state.value.copy(
@@ -8104,7 +8949,7 @@ class LabyrinthEntryRecognitionSession(
                 refreshConfirmedAt = plannedShopRefreshConfirmedAt,
                 now = timestampMillis,
                 hasGenericConfirmation = confirmation != null,
-                timeoutMillis = SHOP_REFRESH_TRANSITION_TIMEOUT_MILLIS,
+                timeoutMillis = if (shoppingModule != null) Long.MAX_VALUE else SHOP_REFRESH_TRANSITION_TIMEOUT_MILLIS,
             ) && confirmation != null
         ) {
             if (
@@ -8134,7 +8979,7 @@ class LabyrinthEntryRecognitionSession(
                     refreshConfirmedAt = plannedShopRefreshConfirmedAt,
                     now = timestampMillis,
                     settleMillis = SHOP_REFRESH_SETTLE_MILLIS,
-                    timeoutMillis = SHOP_REFRESH_TRANSITION_TIMEOUT_MILLIS,
+                    timeoutMillis = if (shoppingModule != null) Long.MAX_VALUE else SHOP_REFRESH_TRANSITION_TIMEOUT_MILLIS,
                 )
             ) {
                 shopRelicPurchasesThisCycle = 0
@@ -8155,7 +9000,8 @@ class LabyrinthEntryRecognitionSession(
         }
 
         if (activeSessionId == sessionId) {
-            _state.value = _state.value.copy(message = "已点击用300更新，等待更新确认弹窗")
+            _state.value = _state.value.copy(message = if (shoppingModule == null) "已点击用300更新，等待更新确认弹窗"
+                else "已点击刷新，等待实际费用确认弹窗")
             overlayCoordinator.update(sessionId, buildOverlayPresentation(sessionId))
         }
         return true

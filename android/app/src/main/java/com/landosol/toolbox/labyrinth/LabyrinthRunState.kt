@@ -5,6 +5,7 @@ import com.landosol.toolbox.data.local.AppDatabase
 import com.landosol.toolbox.data.local.LabyrinthRunCharacterEntity
 import com.landosol.toolbox.data.local.LabyrinthRunRelicEntity
 import com.landosol.toolbox.data.local.LabyrinthRunStateEntity
+import com.landosol.toolbox.data.local.LabyrinthShopOwnershipEntity
 import com.landosol.toolbox.labyrinth.vision.LabyrinthCharacterMatch
 import com.landosol.toolbox.labyrinth.vision.LabyrinthRelicMatch
 
@@ -53,6 +54,16 @@ interface LabyrinthRunStateStore {
         relics: List<LabyrinthRelicMatch> = emptyList(),
         replaceCharacters: Boolean = false,
     ): LabyrinthRunSnapshot
+
+    // receiptId 必须复用已保存的账户 + enter journal 稳定键，不能按重试重新生成。
+    // Room 接受 [A-Za-z0-9][A-Za-z0-9._:-]{0,255}，不裁剪或改写 ID。
+    suspend fun recordShopPurchase(
+        accountId: Long?,
+        receiptId: String,
+        page: String,
+        nowMillis: Long,
+        relics: List<LabyrinthRelicMatch>,
+    ): LabyrinthRunSnapshot = throw UnsupportedOperationException("store does not support durable shop receipts")
 
     suspend fun load(accountId: Long?): LabyrinthRunSnapshot?
 }
@@ -178,6 +189,7 @@ class RoomLabyrinthRunStateStore(
         val dao = database.labyrinthRunStateDao()
         dao.deleteCharacters(key)
         dao.deleteRelics(key)
+        dao.deleteReceipts(key)
         dao.upsertState(
             LabyrinthRunStateEntity(
                 runKey = key,
@@ -200,6 +212,38 @@ class RoomLabyrinthRunStateStore(
         relics: List<LabyrinthRelicMatch>,
         replaceCharacters: Boolean,
     ): LabyrinthRunSnapshot = database.withTransaction {
+        recordPageBody(accountId, page, characters, nowMillis, relics, replaceCharacters)
+    }
+
+    override suspend fun recordShopPurchase(
+        accountId: Long?,
+        receiptId: String,
+        page: String,
+        nowMillis: Long,
+        relics: List<LabyrinthRelicMatch>,
+    ): LabyrinthRunSnapshot {
+        require(SAFE_RECEIPT_ID.matches(receiptId)) { "receiptId 必须为 1..256 位安全 ASCII 标识" }
+        return database.withTransaction {
+            val key = runKey(accountId)
+            val dao = database.labyrinthRunStateDao()
+            if (dao.hasReceipt(key, receiptId)) {
+                snapshot(key)
+            } else {
+                val result = recordPageBody(accountId, page, emptyList(), nowMillis, relics, false)
+                dao.insertReceipt(LabyrinthShopOwnershipEntity(key, receiptId, nowMillis))
+                result
+            }
+        }
+    }
+
+    private suspend fun recordPageBody(
+        accountId: Long?,
+        page: String,
+        characters: List<LabyrinthCharacterMatch>,
+        nowMillis: Long,
+        relics: List<LabyrinthRelicMatch>,
+        replaceCharacters: Boolean,
+    ): LabyrinthRunSnapshot {
         val key = runKey(accountId)
         val dao = database.labyrinthRunStateDao()
         val current = dao.getState(key) ?: LabyrinthRunStateEntity(
@@ -218,12 +262,8 @@ class RoomLabyrinthRunStateStore(
             nowMillis = nowMillis,
             replaceExisting = replaceCharacters,
         )
-        dao.deleteCharacters(key)
-        dao.insertCharacters(merged.map { it.toEntity(key) })
         val existingRelics = dao.getRelics(key).map(LabyrinthRunRelicEntity::toDomain)
         val mergedRelics = LabyrinthRelicMerger.merge(existingRelics, relics, nowMillis)
-        dao.deleteRelics(key)
-        dao.insertRelics(mergedRelics.map { it.toEntity(key) })
         dao.upsertState(
             current.copy(
                 status = ACTIVE,
@@ -236,7 +276,11 @@ class RoomLabyrinthRunStateStore(
                 updatedAt = nowMillis,
             ),
         )
-        snapshot(key)
+        dao.deleteCharacters(key)
+        dao.insertCharacters(merged.map { it.toEntity(key) })
+        dao.deleteRelics(key)
+        dao.insertRelics(mergedRelics.map { it.toEntity(key) })
+        return snapshot(key)
     }
 
     override suspend fun load(accountId: Long?): LabyrinthRunSnapshot? = database.withTransaction {
@@ -264,6 +308,7 @@ class RoomLabyrinthRunStateStore(
     private companion object {
         const val ACTIVE = "ACTIVE"
         const val UNBOUND_RUN_KEY = "account:unbound"
+        val SAFE_RECEIPT_ID = Regex("[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
     }
 }
 

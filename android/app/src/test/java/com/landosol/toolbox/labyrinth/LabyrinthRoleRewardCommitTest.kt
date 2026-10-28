@@ -18,6 +18,34 @@ class LabyrinthRoleRewardCommitTest {
     @Test fun `failed persistence keeps joined recognition available for recovery`() =
         exercise(AutomationBackendResult.Completed, failStore = true, expectedWrites = 1, expectedBypass = false)
 
+    @Test fun `existing fake rejects durable shop receipts without delegating to recordPage`() = runBlocking {
+        val fake = MemoryStore(fail = false)
+        val store: LabyrinthRunStateStore = fake
+        val before = store.load(null)
+        val relic = LabyrinthRelicMatch(
+            slotId = "shop_1", relicId = "14004", displayName = "测试遗物", attribute = "强化",
+            attributeBonus = "1", effect = "", confidence = 0.93,
+            screenRect = EntryPixelRect(0, 0, 10, 10), iconRect = EntryPixelRect(0, 0, 10, 10),
+        )
+        listOf(emptyList(), listOf(relic)).forEach { relics ->
+            try {
+                store.recordShopPurchase(null, "account:unbound:enter:7:shop:1", "SHOP_RECEIPT", 100L, relics)
+                fail("旧 fake 不支持持久回执时必须拒绝写入")
+            } catch (failure: UnsupportedOperationException) {
+                assertEquals("store does not support durable shop receipts", failure.message)
+            }
+        }
+        assertEquals(before, store.load(null))
+        assertEquals(0, fake.writes)
+
+        val recorded = store.recordPage(null, "CHARACTER_JOINED", listOf(LabyrinthCharacterMatch(
+            slotId = "joined", characterId = "1209", displayName = "伊莉亚(新年)", confidence = 0.93,
+            screenRect = EntryPixelRect(0, 0, 10, 10),
+        )), 200L)
+        assertEquals(1, fake.writes)
+        assertEquals(listOf("1209"), recorded.joinedCharacters.map { it.characterId })
+    }
+
     private fun exercise(backend: AutomationBackendResult, failStore: Boolean, expectedWrites: Int, expectedBypass: Boolean) = runBlocking {
         val manager = AutomationSessionManager()
         val store = MemoryStore(failStore)

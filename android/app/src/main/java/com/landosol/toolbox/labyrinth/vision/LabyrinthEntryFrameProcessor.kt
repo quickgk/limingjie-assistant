@@ -379,6 +379,7 @@ data class LabyrinthEntryFrameResult(
     val nodeRelicStackObservation: LabyrinthNodeRelicStackObservation? = null,
     val relicDetailObservation: LabyrinthRelicDetailObservation? = null,
     val shopObservation: LabyrinthShopObservation? = null,
+    val currencyObservation: LabyrinthCurrencyObservation? = null,
     val nodeMoveConfirmation: LabyrinthNodeMoveConfirmationObservation? = null,
     val battleFailure: LabyrinthBattleFailureObservation? = null,
     /** 结束确认 dialog over the failure page; non-null only while such a dialog is open. */

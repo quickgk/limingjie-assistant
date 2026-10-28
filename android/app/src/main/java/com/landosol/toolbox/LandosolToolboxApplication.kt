@@ -65,7 +65,16 @@ import com.landosol.toolbox.labyrinth.LabyrinthAutoRunWorkflow
 import com.landosol.toolbox.labyrinth.LabyrinthAutoRunRoundOutcome
 import com.landosol.toolbox.labyrinth.LabyrinthExecutionGateResult
 import com.landosol.toolbox.labyrinth.validateLabyrinthExecution
+import com.landosol.toolbox.gamedata.RelicResource
+import com.landosol.toolbox.labyrinth.shop.LabyrinthShoppingJournal
+import com.landosol.toolbox.labyrinth.shop.LabyrinthShoppingModule
+import com.landosol.toolbox.labyrinth.vision.EntryPixelRect
+import com.landosol.toolbox.labyrinth.vision.LabyrinthRelicMatch
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -231,7 +240,34 @@ class LandosolToolboxApplication : Application() {
         val characterAttributes = roleDecisionRuntime?.profiles
             ?.mapValues { (_, profile) -> profile.attribute }
             .orEmpty()
+        val shoppingJournal = LabyrinthShoppingJournal(File(filesDir, "labyrinth-shopping")) { directory ->
+            // 清理失败的目录通常下一轮会重试；manifest 写回也失败时它可能已经无法再被清理识别，
+            // 这里至少留一条可查的诊断。
+            Log.w(APP_LOG_TAG, "购物证据清理未完成，可能需要人工处理：${directory.name}")
+        }
+        // 现有模板 loader 的 loadRelics 私有；只读同一资产元数据，不为恢复回执加载/重绘图标。
+        val shoppingRelics by lazy {
+            val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+            val root = assets.open("resource-packs/cn-bilibili/relics.laby-workbook.json").bufferedReader(Charsets.UTF_8)
+                .use { json.parseToJsonElement(it.readText()).jsonObject }
+            root["relics"]?.jsonArray.orEmpty().map { json.decodeFromJsonElement<RelicResource>(it) }
+        }
         LabyrinthEntryRecognitionSession(
+            shoppingJournal = shoppingJournal,
+            shoppingModule = LabyrinthShoppingModule(shoppingJournal),
+            shoppingRelicResolver = { identity ->
+                val relic = shoppingRelics.singleOrNull { it.id == identity }
+                    ?: shoppingRelics.singleOrNull { it.name.filterNot(Char::isWhitespace) == identity.filterNot(Char::isWhitespace) }
+                relic?.let {
+                    val rect = EntryPixelRect(0, 0, 1, 1)
+                    LabyrinthRelicMatch(
+                        slotId = "shop_receipt_catalog", relicId = it.id, displayName = it.name,
+                        attribute = it.mark.ifBlank { it.tags.firstOrNull().orEmpty() }.ifBlank { "特殊" },
+                        attributeBonus = it.markBonus, effect = it.effect, confidence = 1.0,
+                        screenRect = rect, iconRect = rect,
+                    )
+                }
+            },
             strategyProvider = {
                 val settings = labyrinthStrategySettings.state.value
                 com.landosol.toolbox.labyrinth.LabyrinthStrategySnapshot(

@@ -285,4 +285,18 @@ internal object AndroidChineseRoleNameOcr {
             .addOnSuccessListener { result -> callback(result.text.trim()) }
             .addOnFailureListener { callback(null) }
     }
+
+    /** 元素框保留左右余额的独立位置，不依赖战果模块DTO。 */
+    fun readElementsAsync(bitmap: Bitmap, callback: (List<LabyrinthShopOcrLine>?) -> Unit) {
+        recognizer.process(InputImage.fromBitmap(bitmap, 0)).addOnSuccessListener { result ->
+            callback(result.textBlocks.flatMap { block -> block.lines.flatMap { line ->
+                line.elements.map { element ->
+                    LabyrinthShopOcrLine(element.text, element.boundingBox?.let { box ->
+                        EntryPixelRect(box.left.coerceAtLeast(0), box.top.coerceAtLeast(0),
+                            box.width().coerceAtLeast(1), box.height().coerceAtLeast(1))
+                    })
+                }
+            } })
+        }.addOnFailureListener { callback(null) }
+    }
 }

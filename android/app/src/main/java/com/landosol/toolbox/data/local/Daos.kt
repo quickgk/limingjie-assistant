@@ -121,6 +121,15 @@ interface LabyrinthRunStateDao {
 
     @Query("DELETE FROM labyrinth_run_relics WHERE run_key = :runKey")
     suspend fun deleteRelics(runKey: String)
+
+    @Query("SELECT EXISTS(SELECT 1 FROM labyrinth_shop_ownership WHERE run_key = :runKey AND receipt_id = :receiptId)")
+    suspend fun hasReceipt(runKey: String, receiptId: String): Boolean
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertReceipt(receipt: LabyrinthShopOwnershipEntity)
+
+    @Query("DELETE FROM labyrinth_shop_ownership WHERE run_key = :runKey")
+    suspend fun deleteReceipts(runKey: String)
 }
 
 @Dao

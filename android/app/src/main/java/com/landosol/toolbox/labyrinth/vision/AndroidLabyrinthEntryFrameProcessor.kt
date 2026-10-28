@@ -240,9 +240,30 @@ class AndroidLabyrinthEntryFrameProcessor private constructor(
     private val nodeRelicStackResolver: AndroidLabyrinthNodeRelicStackResolver,
     private val relicDetailResolver: AndroidLabyrinthRelicDetailResolver,
     private val skipJoinedCharacters: () -> Boolean,
+    private val shopTitleTemplate: PixelImage,
 ) {
+    private val currencyResolver = AndroidLabyrinthCurrencyResolver()
+    private val shopPriceResolver = AndroidLabyrinthShopPriceResolver()
+    private val shopTitleMatcher = GradientTemplateMatcher()
+
     fun process(frame: CapturedFrame): LabyrinthEntryFrameResult {
         val started = System.nanoTime()
+        val receipt = shopItemResolver.fastReceipt(frame.bitmap) {
+            // 外框粗筛通过后只评分一个商店标题，不修改核心入口预缩及特别装备流程。
+            val image = AndroidPixelImageAdapter.from(frame.bitmap)
+            val rect = ReferenceFitMapper.map(image.width, image.height, EntryReferenceSize(1920, 1080),
+                EntryReferenceRect(850, 50, 220, 75))
+            rect?.let { shopTitleMatcher.score(image, it, shopTitleTemplate) } ?: 0.0
+        }?.let { receipt ->
+            shopPriceResolver.clear()
+            currencyResolver.clear()
+            val elapsed = (System.nanoTime() - started) / 1_000_000
+            receipt.copy(elapsedMillis = elapsed, stageMillis = mapOf("shopReceiptFast" to elapsed))
+        }
+        return resolveShopReceiptOrPage(receipt) { processPage(frame, started) }
+    }
+
+    private fun processPage(frame: CapturedFrame, started: Long): LabyrinthEntryFrameResult {
         val result = processor.process(
             AndroidPixelImageAdapter.from(frame.bitmap),
             deferRoleRewardPortraits = true,
@@ -259,7 +280,9 @@ class AndroidLabyrinthEntryFrameProcessor private constructor(
         val nodeStarted = System.nanoTime()
         val nodeResolved = nodeRelicStackResolver.resolve(frame.bitmap, relicResolved)
         val detailStarted = System.nanoTime()
-        val resolved = relicDetailResolver.resolve(frame.bitmap, nodeResolved)
+        val detailResolved = relicDetailResolver.resolve(frame.bitmap, nodeResolved)
+        val priceResolved = shopPriceResolver.resolve(frame.bitmap, detailResolved)
+        val resolved = currencyResolver.resolve(frame.bitmap, priceResolved)
         val finished = System.nanoTime()
         return resolved.copy(
             elapsedMillis = (finished - started) / 1_000_000,
@@ -344,6 +367,7 @@ class AndroidLabyrinthEntryFrameProcessor private constructor(
                 nodeRelicStackResolver = AndroidLabyrinthNodeRelicStackResolver(),
                 relicDetailResolver = AndroidLabyrinthRelicDetailResolver(),
                 skipJoinedCharacters = skipJoinedCharacters,
+                shopTitleTemplate = entryTemplates[EntryAnchorId.SHOP_TITLE],
             )
         }
     }

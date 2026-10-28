@@ -17,9 +17,10 @@ import androidx.room.withTransaction
         LabyrinthRunStateEntity::class,
         LabyrinthRunCharacterEntity::class,
         LabyrinthRunRelicEntity::class,
+        LabyrinthShopOwnershipEntity::class,
         MigrationCheckpointEntity::class,
     ],
-    version = 4,
+    version = 5,
     exportSchema = true,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -163,13 +164,33 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `labyrinth_shop_ownership` (
+                        `run_key` TEXT NOT NULL,
+                        `receipt_id` TEXT NOT NULL,
+                        `committed_at` INTEGER NOT NULL,
+                        PRIMARY KEY(`run_key`, `receipt_id`),
+                        FOREIGN KEY(`run_key`) REFERENCES `labyrinth_run_states`(`run_key`) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_labyrinth_shop_ownership_run_key_committed_at` " +
+                        "ON `labyrinth_shop_ownership` (`run_key`, `committed_at`)",
+                )
+            }
+        }
+
         fun create(context: Context): AppDatabase = Room.databaseBuilder(
             context.applicationContext,
             AppDatabase::class.java,
             FILE_NAME,
         )
             .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
             .build()
     }
 }

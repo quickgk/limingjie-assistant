@@ -2,16 +2,48 @@ package com.landosol.toolbox.labyrinth.vision
 
 import android.graphics.Bitmap
 
+/** 快速路径和普通路径共用回退：否定结果不能再次抢占已识别页面。 */
+internal fun resolveShopReceiptOrPage(
+    receipt: LabyrinthEntryFrameResult?,
+    page: () -> LabyrinthEntryFrameResult,
+): LabyrinthEntryFrameResult = receipt ?: page()
+
 /** Every visible title is classified before a relic match can authorize a purchase. */
 class AndroidLabyrinthShopItemResolver(
     submitTextRead: (Bitmap, (String?) -> Unit) -> Unit = AndroidChineseRoleNameOcr::readAsync,
+    submitReceiptLines: (Bitmap, (List<LabyrinthShopOcrLine>?) -> Unit) -> Unit = AndroidChineseRoleNameOcr::readElementsAsync,
 ) {
+    private val receiptResolver = AndroidLabyrinthShopReceiptResolver(submit = submitReceiptLines)
     private val ocr = AndroidRelicRoiOcr(submitTextRead, maximumAttempts = 1)
     private val categories = LabyrinthShopCategoryResolution()
     private val accepted = mutableMapOf<String, Pair<Long, RelicOcrScheduler.Read>>()
 
+    fun fastReceipt(bitmap: Bitmap, shopTitleScore: () -> Double): LabyrinthEntryFrameResult? {
+        if (bitmap.width <= bitmap.height || !modalShellVisible(bitmap) || shopTitleScore() < 0.65) {
+            receiptResolver.clear()
+            return null
+        }
+        return receiptResolver.resolve(bitmap)
+    }
+
     @Synchronized
     fun resolve(bitmap: Bitmap, result: LabyrinthEntryFrameResult): LabyrinthEntryFrameResult {
+        val scores = result.observation.anchorScores
+        // 外框只启动OCR；成功与点击仍须标题、六字段双读、余额差额及按钮位置共同核验。
+        val receiptShell = modalShellVisible(bitmap) &&
+            (scores[EntryAnchorId.SHOP_TITLE] >= 0.65 ||
+                result.observation.state == LabyrinthEntryPageState.SHOP_PURCHASE_COMPLETE)
+        val receipt = if (receiptShell) receiptResolver.resolve(bitmap) else {
+            receiptResolver.clear()
+            null
+        }
+        return resolveShopReceiptOrPage(receipt?.let {
+            result.copy(observation = it.observation, shopObservation = it.shopObservation,
+                matchedFeatures = result.matchedFeatures + it.matchedFeatures)
+        }) { resolveItems(bitmap, result) }
+    }
+
+    private fun resolveItems(bitmap: Bitmap, result: LabyrinthEntryFrameResult): LabyrinthEntryFrameResult {
         if (result.observation.state != LabyrinthEntryPageState.SHOP) {
             ocr.clear()
             categories.clear()
@@ -57,6 +89,25 @@ class AndroidLabyrinthShopItemResolver(
             resolved
         }
         return result.copy(shopObservation = shop.copy(items = items))
+    }
+
+    private fun modalShellVisible(bitmap: Bitmap): Boolean {
+        fun color(x: Int, y: Int): Int? {
+            val rect = ReferenceFitMapper.map(bitmap.width, bitmap.height, STANDARD_REFERENCE,
+                EntryReferenceRect(x - 3, y - 3, 6, 6)) ?: return null
+            return bitmap.getPixel(rect.left + rect.width / 2, rect.top + rect.height / 2)
+        }
+        fun blue(x: Int, y: Int): Boolean = color(x, y)?.let {
+            val red = it ushr 16 and 255
+            val green = it ushr 8 and 255
+            val blue = it and 255
+            blue > 145 && blue > red + 45 && green > 85
+        } ?: false
+        fun white(x: Int, y: Int): Boolean = color(x, y)?.let {
+            (it ushr 16 and 255) > 225 && (it ushr 8 and 255) > 225 && (it and 255) > 225
+        } ?: false
+        return blue(600, 280) && blue(1300, 280) && white(600, 500) && white(1340, 500) &&
+            blue(810, 735) && blue(1110, 735)
     }
 
     private companion object {

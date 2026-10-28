@@ -1,27 +1,40 @@
 package com.landosol.toolbox.labyrinth
 
+import com.landosol.toolbox.labyrinth.shop.LabyrinthShopBudgetPlanner
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemMatch
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemKind
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopCategoryState
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemStatus
 
+data class LabyrinthShopBudgetSummary(
+    val balance: Long,
+    val basketCost: Long,
+    val directScore: Int,
+    val reserve: Long,
+    val selectedSlots: List<String>,
+)
+
 sealed interface LabyrinthShopDecision {
+    val budget: LabyrinthShopBudgetSummary? get() = null
+
     data class BuyRelic(
         val item: LabyrinthShopItemMatch,
         val relicDecision: LabyrinthRelicChoiceDecision,
+        override val budget: LabyrinthShopBudgetSummary? = null,
     ) : LabyrinthShopDecision
 
     data class BuyRoleImprint(
         val item: LabyrinthShopItemMatch,
         val label: String,
         val reason: String,
+        override val budget: LabyrinthShopBudgetSummary? = null,
     ) : LabyrinthShopDecision {
-        /** 选择印记 opens a full-roster picker after purchase; 随机印记 grants a role outright. */
+        /** 选择印记打开角色选择页；随机印记直接授予角色。 */
         val opensRolePicker: Boolean get() = item.choiceRoleImprint
     }
 
-    data class Refresh(val reason: String) : LabyrinthShopDecision
-    data class Close(val reason: String) : LabyrinthShopDecision
+    data class Refresh(val reason: String, override val budget: LabyrinthShopBudgetSummary? = null) : LabyrinthShopDecision
+    data class Close(val reason: String, override val budget: LabyrinthShopBudgetSummary? = null) : LabyrinthShopDecision
     data class Wait(val reason: String) : LabyrinthShopDecision
 }
 
@@ -58,6 +71,14 @@ class LabyrinthShopPolicy(
      * spends coins. Areas absent from this map keep the unlimited behaviour.
      */
     private val refreshLimitsByArea: Map<Int, Int> = mapOf(3 to 1),
+    /**
+     * 预算组合分支开关。
+     *
+     * 默认 false 只是为了让未接购物模块的旧调用与回放测试继续走原分支；生产装配
+     * （LandosolToolboxApplication 注入 shoppingModule）恒为 true，没有面向用户的开关。
+     * 也就是说：这里不是灰度，而是「旧分支仅测试保留」。
+     */
+    private val budgetOptimizationEnabled: Boolean = false,
 ) {
     fun decide(
         currentArea: Int?,
@@ -69,6 +90,8 @@ class LabyrinthShopPolicy(
         relicPurchasesInCycle: Int = 0,
         refreshAvailabilityKnown: Boolean = true,
         refreshesUsedInVisit: Int = 0,
+        verifiedBalance: Long? = null,
+        verifiedRefreshPrice: Long? = null,
     ): LabyrinthShopDecision {
         if (!buyRelics) return LabyrinthShopDecision.Close("策略已关闭商店购买，退出商店")
         val refreshAllowed = refreshEnabled && currentArea != null && currentArea >= finalArea
@@ -82,6 +105,13 @@ class LabyrinthShopPolicy(
         // that to 3 must affect areas 3 and 5 only, never hand area 4 a spending license.
         if (currentArea != null && currentArea in noPurchaseAreas) {
             return LabyrinthShopDecision.Close("区域${currentArea}按策略不购买商店商品，直接退出")
+        }
+        if (budgetOptimizationEnabled) {
+            return budgetDecision(
+                currentArea, items, acquired, calibratedStacks, lockedFocus,
+                refreshAllowed, refreshPermitted, refreshAvailable, refreshAvailabilityKnown,
+                relicPurchasesInCycle, verifiedBalance, verifiedRefreshPrice,
+            )
         }
 
         // Exact role identity is required before spending coins on an imprint. A coarse
@@ -224,5 +254,121 @@ class LabyrinthShopPolicy(
                 else -> "区域${currentArea ?: "?"}当前无可确认遗物或可购买印记，结束商店"
             },
         )
+    }
+
+    private fun budgetDecision(
+        currentArea: Int?,
+        items: List<LabyrinthShopItemMatch>,
+        acquired: List<LabyrinthObservedRelic>,
+        calibratedStacks: Map<LabyrinthRelicMark, Int>,
+        lockedFocus: LabyrinthRelicMark?,
+        refreshAllowed: Boolean,
+        refreshPermitted: Boolean,
+        refreshAvailable: Boolean,
+        refreshAvailabilityKnown: Boolean,
+        relicPurchasesInCycle: Int,
+        balance: Long?,
+        refreshPrice: Long?,
+    ): LabyrinthShopDecision {
+        val visibleStockExhausted = items.size == relicsPerStockCycle && items.all {
+            it.categoryState == LabyrinthShopCategoryState.READY && it.kind == LabyrinthShopItemKind.ROLE_IMPRINT
+        }
+        val cycleCompleted = relicPurchasesInCycle >= relicsPerStockCycle || visibleStockExhausted
+        val noActionableRelicInRow = items.size == relicsPerStockCycle && items.all {
+            it.status == LabyrinthShopItemStatus.DISABLED ||
+                (it.purchasable && it.categoryState == LabyrinthShopCategoryState.READY &&
+                    it.kind == LabyrinthShopItemKind.ROLE_IMPRINT)
+        }
+        val stockCanRefresh = cycleCompleted || noActionableRelicInRow
+        if (refreshAllowed && items.any { it.status == LabyrinthShopItemStatus.UNKNOWN }) {
+            return LabyrinthShopDecision.Wait("商店商品按钮尚未完整识别，等待稳定后再计算预算")
+        }
+        val reading = items.firstOrNull { it.purchasable && it.categoryState == LabyrinthShopCategoryState.READING }
+        if (reading != null) {
+            return LabyrinthShopDecision.Wait("${reading.slotId}正在确认商品类别（${reading.categoryAttempt}/3轮）")
+        }
+        // 禁用商品与识别已耗尽的未知商品仍按原安全规则跳过，不阻塞整店。
+        val live = items.filter { it.purchasable && it.categoryState == LabyrinthShopCategoryState.READY }
+        val unidentified = live.firstOrNull { item ->
+            !LabyrinthShopBudgetPlanner.eligible(item) &&
+                !(item.kind == LabyrinthShopItemKind.ROLE_IMPRINT && item.choiceRoleImprint &&
+                    !item.roleImprintLabel.isNullOrBlank())
+        }
+        if (unidentified != null) {
+            return LabyrinthShopDecision.Wait("${unidentified.slotId}商品身份未核实，拒绝按不完整库存盲买")
+        }
+        if (refreshPermitted && !refreshAvailabilityKnown && (live.isNotEmpty() || stockCanRefresh)) {
+            return LabyrinthShopDecision.Wait("等待刷新按钮稳定识别后计算实际预算")
+        }
+        if (live.isEmpty() && !(refreshPermitted && refreshAvailable && stockCanRefresh)) {
+            return LabyrinthShopDecision.Close("没有可确认购买项或符合策略的刷新，结束商店")
+        }
+        if (balance == null || balance < 0) {
+            return LabyrinthShopDecision.Wait("等待当前余额两次独立识别复核，拒绝盲买或刷新")
+        }
+        if (live.any { it.verifiedPrice == null || it.verifiedPrice!! < 0 }) {
+            return LabyrinthShopDecision.Wait("等待可购买商品价格两次独立识别复核，不猜价格或折扣")
+        }
+        val canRefresh = refreshPermitted && refreshAvailable
+        if (canRefresh && (refreshPrice == null || refreshPrice < 0)) {
+            return LabyrinthShopDecision.Wait("等待本次刷新实际费用复核，不按固定费用预支")
+        }
+        val plan = try {
+            LabyrinthShopBudgetPlanner.plan(
+                items, balance, relicChoicePolicy.markStacks(acquired, calibratedStacks), refreshPrice, canRefresh,
+            )
+        } catch (error: IllegalArgumentException) {
+            return LabyrinthShopDecision.Wait("预算输入不安全：${error.message}")
+        }
+        val summary = LabyrinthShopBudgetSummary(
+            balance, plan.cost, plan.score, plan.reserve, plan.selected.map { it.slotId },
+        )
+        // 有已识别商品周转依据时，释放预留不能被售罄刷新优先级绕过；
+        // 全禁用且价格未知的行仍保留原售罄恢复规则，仅核实实际刷新费用。
+        val refreshEnvelopeAvailable = plan.reserve > 0 || items.none {
+            it.categoryState == LabyrinthShopCategoryState.READY &&
+                LabyrinthShopBudgetPlanner.eligible(it) && it.verifiedPrice != null
+        }
+        if (canRefresh && stockCanRefresh && refreshPrice!! <= balance && refreshEnvelopeAvailable) {
+            return LabyrinthShopDecision.Refresh(
+                "当前遗物轮已耗尽，按策略使用核实费用${refreshPrice}币刷新；${plan.reason}", summary,
+            )
+        }
+        val relics = plan.selected.filter { it.kind == LabyrinthShopItemKind.RELIC }
+        if (relics.isNotEmpty()) {
+            val decision = relicChoicePolicy.choose(
+                acquired, relics.mapNotNull { it.relicMatch }, lockedFocus,
+                calibratedStacks, currentArea,
+            ) ?: return LabyrinthShopDecision.Wait("已选预算组合缺少可确认遗物属性，拒绝盲买")
+            val item = relics.first { it.relicMatch?.relicId == decision.choice.relicId }
+            return LabyrinthShopDecision.BuyRelic(
+                item, decision.copy(reason = "${plan.reason}；${decision.reason}"), summary,
+            )
+        }
+        val role = plan.selected.sortedWith(
+            compareByDescending<LabyrinthShopItemMatch> { LabyrinthShopBudgetPlanner.preferredRole(it) }
+                .thenBy { it.slotId },
+        ).firstOrNull()
+        if (role != null) {
+            return LabyrinthShopDecision.BuyRoleImprint(
+                role, role.roleImprintLabel!!, "${plan.reason}；购买预算内随机职能印记", summary,
+            )
+        }
+        // 选择印记不参加源算法组合搜索；仅在无可买遗物/随机印记且不能刷新时保留原兜底。
+        val affordableEligible = live.any {
+            LabyrinthShopBudgetPlanner.eligible(it) && it.verifiedPrice!! <= balance
+        }
+        val choice = live.filter {
+            it.kind == LabyrinthShopItemKind.ROLE_IMPRINT && it.choiceRoleImprint &&
+                it.verifiedPrice!! <= balance - plan.reserve
+        }.minByOrNull { it.slotId }
+        if (!affordableEligible && choice != null) {
+            return LabyrinthShopDecision.BuyRoleImprint(
+                choice, choice.roleImprintLabel!!,
+                "遗物/随机印记无可买且无法按策略刷新，按核实价格${choice.verifiedPrice}币购买选择印记兜底",
+                summary.copy(basketCost = choice.verifiedPrice!!, selectedSlots = listOf(choice.slotId)),
+            )
+        }
+        return LabyrinthShopDecision.Close("当前已核实库存没有预算内购买项或符合策略的刷新；${plan.reason}", summary)
     }
 }
