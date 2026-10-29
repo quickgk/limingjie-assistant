@@ -476,7 +476,7 @@ internal const val POST_ENTRY_STALL_TIMEOUT_MILLIS = 120_000L
  * 购物流程连续无进展多久后停止整局。
  *
  * 购物是唯一「既不能盲点、也不许退出兜底」的流程：回执读不出、刷新差额对不上、确认页丢了预算
- * 证据时，它只能等。等是必要的（六字段双读、Room 对账都需要几个节拍），但 hold 帧会让
+ * 证据时，它只能等。等是必要的（回执双读、Room 对账都需要几个节拍），但 hold 帧会让
  * processFrameResult 直接返回、绕过通用停滞看门狗，所以期限必须自带，否则无人值守批跑会静默挂住。
  *
  * 180 秒覆盖 20 秒的标题 OCR 兜底与串行 OCR 排队的最坏情况，仍保证一定终止并留下原因。
@@ -1095,6 +1095,11 @@ internal fun labyrinthSessionBlockObservation(
         labyrinthShopBackgroundVisible(result) &&
         result.observation.anchorScores[EntryAnchorId.SESSION_RETURN_TITLE] < SESSION_RETURN_TITLE_MIN_SCORE
     ) {
+        return LabyrinthSessionBlockObservation(SessionBlockKind.NONE, returnTitleRect = null)
+    }
+    // 同样的蓝标题条也出现在购买完毕回执上，回执自己的「确认」按钮还会踩中返回标题模板：
+    // 回执尚未认出来时若判成掉线，一点就把这一笔回执点没了。回执标题有分就让出。
+    if (result.observation.anchorScores[EntryAnchorId.SHOP_PURCHASE_COMPLETE_TITLE] >= SHOP_RECEIPT_DIALOG_MIN_SCORE) {
         return LabyrinthSessionBlockObservation(SessionBlockKind.NONE, returnTitleRect = null)
     }
     val kind = classifier.classify(
@@ -3327,26 +3332,44 @@ class LabyrinthEntryRecognitionSession(
 
     private fun shoppingLeaseValid(lease: ShoppingBudgetLease, result: LabyrinthEntryFrameResult, now: Long): Boolean {
         val page = result.observation.state
-        val allowedPage = page in setOf(LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION,
-            LabyrinthEntryPageState.UNKNOWN, LabyrinthEntryPageState.GAME_LOADING_PROGRESS,
-            LabyrinthEntryPageState.PRE_HOME_DATA_LOADING)
         val shop = result.shopObservation
+        // 购买按钮按下后游戏仍会先渲染一两帧商店页，确认框随后才出现：这段过渡仍属于同一次购买，
+        // 预算证据不能因为页面还没切走就作废。
+        val shopPageTransition = lease.intentId != null && page == LabyrinthEntryPageState.SHOP
+        // 刷新同理：点下刷新后先停在商店页，随后弹出与退出确认同版的刷新确认框。
+        val refreshPageTransition = lease.intentId == null &&
+            page in setOf(LabyrinthEntryPageState.SHOP, LabyrinthEntryPageState.SHOP_EXIT_CONFIRMATION)
+        val allowedPage = shopPageTransition || refreshPageTransition || page in setOf(
+            LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION, LabyrinthEntryPageState.UNKNOWN,
+            LabyrinthEntryPageState.GAME_LOADING_PROGRESS, LabyrinthEntryPageState.PRE_HOME_DATA_LOADING)
         val events = shoppingEvents()
         val context = lease.intentId?.let { id -> events.singleOrNull { shoppingEventId(it) == id }?.let(::shoppingEventPayload) }
+        // 确认弹窗占住画面后背景商品被遮罩，价格与余额OCR只在商店页运行：背景列表不是当帧证据，
+        // 购买身份由弹窗自己的图标候选核对。
+        val dialogCovered = page == LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION ||
+            shop?.dialogState == LabyrinthShopDialogState.PURCHASE_CONFIRMATION
+        val liveItems = if (dialogCovered) emptyList() else shop?.items.orEmpty()
         val currentPricesMatch = if (lease.intentId == null) {
             shop?.refreshPriceRead == null || shop.verifiedRefreshPrice == lease.price
-        } else context != null && (shop?.items.isNullOrEmpty() || shop?.items?.singleOrNull {
+        } else context != null && (liveItems.isEmpty() || liveItems.singleOrNull {
             it.slotId == context["slot_id"]?.jsonPrimitive?.contentOrNull
-        }?.let { it.verifiedPrice == lease.price &&
-            (it.relicMatch?.displayName ?: it.titleText)?.filterNot(Char::isWhitespace) == context["item_name"]?.jsonPrimitive?.contentOrNull &&
-            it.relicMatch?.relicId == context["item_id"]?.jsonPrimitive?.contentOrNull &&
-            it.roleImprintLabel == context["role_label"]?.jsonPrimitive?.contentOrNull } == true)
+        }?.let { item -> (item.verifiedPrice == null || item.verifiedPrice == lease.price) &&
+            (item.relicMatch?.displayName ?: item.titleText)?.filterNot(Char::isWhitespace) == context["item_name"]?.jsonPrimitive?.contentOrNull &&
+            item.relicMatch?.relicId == context["item_id"]?.jsonPrimitive?.contentOrNull &&
+            item.roleImprintLabel == context["role_label"]?.jsonPrimitive?.contentOrNull } == true)
         val candidate = shop?.purchaseCandidate
         val candidateMatches = candidate == null || (context != null && candidate.recognized &&
             candidate.relicId == context["item_id"]?.jsonPrimitive?.contentOrNull &&
             candidate.displayName?.filterNot(Char::isWhitespace) == context["item_name"]?.jsonPrimitive?.contentOrNull)
-        return allowedPage && currentPricesMatch && candidateMatches && result.shopObservation?.dialogState !in setOf(
-            LabyrinthShopDialogState.PURCHASE_COMPLETE, LabyrinthShopDialogState.EXIT_CONFIRMATION) &&
+        // 购买确认把退出确认当无关弹窗；刷新确认本身就是那一版确认框，反过来把购买弹窗当无关。
+        val dialogStateAllows = if (lease.intentId == null) {
+            shop?.dialogState !in setOf(LabyrinthShopDialogState.PURCHASE_COMPLETE,
+                LabyrinthShopDialogState.PURCHASE_CONFIRMATION)
+        } else {
+            shop?.dialogState !in setOf(LabyrinthShopDialogState.PURCHASE_COMPLETE,
+                LabyrinthShopDialogState.EXIT_CONFIRMATION)
+        }
+        return allowedPage && dialogStateAllows && currentPricesMatch && candidateMatches &&
             result.shopObservation?.purchaseReceipt == null &&
             now - lease.observedAt in 0..15_000L && lease.png.isNotEmpty() &&
             lease.sessionId == activeSessionId && lease.accountId == activeRunAccountId &&
@@ -7665,12 +7688,7 @@ class LabyrinthEntryRecognitionSession(
                 check(result.observation.state == LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION &&
                     shop.dialogState == LabyrinthShopDialogState.PURCHASE_CONFIRMATION) { "不是同一购买确认页" }
                 check(module.verifiedBalance == lease.balance) { "确认时耐久核实余额与意图不一致" }
-                shop.items.takeIf { it.isNotEmpty() }?.let { items ->
-                    val currentItem = items.single { it.slotId == context["slot_id"]?.jsonPrimitive?.contentOrNull }
-                    check(currentItem.verifiedPrice == lease.price &&
-                        (currentItem.relicMatch?.displayName ?: currentItem.titleText)?.filterNot(Char::isWhitespace) ==
-                        context["item_name"]?.jsonPrimitive?.contentOrNull) { "确认页当前价格或商品与意图不一致" }
-                }
+                // 确认页的价格与余额OCR不运行，背景商品又被弹窗遮住：当帧身份只由弹窗自己的图标候选核对。
                 check(pending["node_id"]?.jsonPrimitive?.longOrNull == shoppingNodeId() &&
                     pending["floor"]?.jsonPrimitive?.intOrNull == shoppingFloor()) { "购买确认节点发生变化" }
                 result.currencyObservation?.balance?.let { balance ->
@@ -10678,6 +10696,8 @@ class LabyrinthEntryRecognitionSession(
 }
 
 private const val SESSION_RETURN_TITLE_MIN_SCORE = 0.45
+/** 购买完毕回执弹窗的标题模板；回执与掉线弹窗共用蓝标题条，有这点分数就按店铺弹窗处理。 */
+private const val SHOP_RECEIPT_DIALOG_MIN_SCORE = 0.45
 private const val SESSION_DATE_CHANGE_TITLE_MIN_SCORE = 0.72
 private const val SESSION_DATE_CHANGE_CONFIRM_MIN_SCORE = 0.55
 private const val NODE_VIEWPORT_SIGNATURE_BUCKET_PX = 32

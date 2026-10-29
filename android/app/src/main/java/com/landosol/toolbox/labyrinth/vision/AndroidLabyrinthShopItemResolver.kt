@@ -29,7 +29,7 @@ class AndroidLabyrinthShopItemResolver(
     @Synchronized
     fun resolve(bitmap: Bitmap, result: LabyrinthEntryFrameResult): LabyrinthEntryFrameResult {
         val scores = result.observation.anchorScores
-        // 外框只启动OCR；成功与点击仍须标题、六字段双读、余额差额及按钮位置共同核验。
+        // 外框只启动OCR；成功与点击仍须标题、字段双读、余额差额及确认矩形共同核验。
         val receiptShell = modalShellVisible(bitmap) &&
             (scores[EntryAnchorId.SHOP_TITLE] >= 0.65 ||
                 result.observation.state == LabyrinthEntryPageState.SHOP_PURCHASE_COMPLETE)

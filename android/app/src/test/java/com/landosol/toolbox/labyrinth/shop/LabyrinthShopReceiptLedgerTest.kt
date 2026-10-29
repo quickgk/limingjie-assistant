@@ -24,22 +24,20 @@ class LabyrinthShopReceiptLedgerTest {
     }
     private fun corrupt(event: JsonObject) = File(run.directory, event["evidence_ref"]!!.jsonPrimitive.content).writeBytes(byteArrayOf(9))
 
-    @Test fun `回执六区域必须各自双读不能只凭标题`() {
+    @Test fun `回执各区域必须各自双读不能只凭标题`() {
         val receipt = ShoppingTestData.receipt()
         listOf(receipt.copy(heading = receipt.heading!!.copy(confirmations = 1)),
             receipt.copy(item = receipt.item!!.copy(confirmations = 1)),
             receipt.copy(expenditure = receipt.expenditure!!.copy(confirmations = 1)),
             receipt.copy(balanceBefore = receipt.balanceBefore!!.copy(confirmations = 1)),
-            receipt.copy(balanceAfter = receipt.balanceAfter!!.copy(confirmations = 1)),
-            receipt.copy(button = receipt.button!!.copy(confirmations = 1)))
+            receipt.copy(balanceAfter = receipt.balanceAfter!!.copy(confirmations = 1)))
             .forEach { ShoppingTestData.reject { record(it) } }
         assertTrue(store.read(run).isEmpty())
     }
 
-    @Test fun `标题或按钮文字及确认矩形不符严格拒绝`() {
+    @Test fun `标题或确认矩形不符严格拒绝`() {
         val receipt = ShoppingTestData.receipt()
-        listOf(receipt.copy(heading = ShoppingTestData.read("确认购买")),
-            receipt.copy(button = ShoppingTestData.read("关闭")), receipt.copy(confirmRect = null))
+        listOf(receipt.copy(heading = ShoppingTestData.read("确认购买")), receipt.copy(confirmRect = null))
             .forEach { ShoppingTestData.reject { record(it) } }
         assertTrue(store.read(run).isEmpty())
     }

@@ -27,8 +27,9 @@ data class LabyrinthShopPurchaseReceiptObservation(
     }
     val before: Long? get() = balanceBefore?.text?.let(::parseAmount)
     val after: Long? get() = balanceAfter?.text?.let(::parseAmount)
+    /** 参与复核的只有标题与四项交易事实；确认按钮由弹窗标题和确认矩形几何证明，不靠 OCR 认字。 */
     val independentReadsConfirmed: Boolean get() =
-        listOf(heading, item, expenditure, balanceBefore, balanceAfter, button)
+        listOf(heading, item, expenditure, balanceBefore, balanceAfter)
             .all { it != null && it.confirmations >= 2 }
     val verified: Boolean get() = reviewReason == null
     val reviewReason: String? get() = when {
@@ -37,7 +38,7 @@ data class LabyrinthShopPurchaseReceiptObservation(
         itemName == null -> "购买商品名称无法可靠解析"
         spent == null || before == null || after == null -> "实际花费或前后余额无法可靠解析"
         spent!! <= 0 || before!! < spent!! || before!! - spent!! != after -> "购买花费与余额差额不一致"
-        button?.text?.filterNot(Char::isWhitespace) != "确认" || confirmRect == null -> "回执确认按钮未核实"
+        confirmRect == null -> "回执确认按钮未核实"
         else -> null
     }
 

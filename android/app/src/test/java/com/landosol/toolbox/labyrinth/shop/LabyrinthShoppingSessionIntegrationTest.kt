@@ -119,7 +119,7 @@ class LabyrinthShoppingSessionIntegrationTest {
         try {
             fixture.start(); fixture.buy(); fixture.confirm()
             fixture.set("lastObservedPageState", LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION)
-            val pending = completed(receipt.copy(button = ShoppingTestData.read("确认", 1)))
+            val pending = completed(receipt.copy(balanceAfter = ShoppingTestData.read("900", 1)))
             fixture.call("processFrameResult", fixture.id(), pending, 1920, 1080, fixture.now)
             fixture.awaitIdle()
             assertEquals(LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION, fixture.get("lastObservedPageState"))
@@ -818,8 +818,16 @@ class LabyrinthShoppingSessionIntegrationTest {
             good.confirm()
             assertEquals(2, good.taps.get())
         } finally { good.stop() }
+        // 商店页仍要求当帧核实价格与意图一致：读到不同价格立即作废预算证据。
+        val repriced = Fixture(temp.newFolder())
+        try {
+            repriced.start(); repriced.buy()
+            repriced.observe(stock(goods = listOf(item.copy(priceRead = ShoppingTestData.read("101")))))
+            repriced.confirm()
+            assertEquals(1, repriced.taps.get())
+            assertFalse(repriced.types().contains("shop.purchase_confirm_prepared"))
+        } finally { repriced.stop() }
         for (bad in listOf(confirmation().copy(currencyObservation = ShoppingTestData.wallet(999)),
-            confirmation().copy(shopObservation = confirmation().shopObservation!!.copy(items = listOf(item.copy(priceRead = ShoppingTestData.read("101"))))),
             confirmation().copy(shopObservation = confirmation().shopObservation!!.copy(purchaseCandidate = item.relicMatch!!.copy(displayName = "其它遗物"))))) {
             val fixture = Fixture(temp.newFolder())
             try {
@@ -829,6 +837,73 @@ class LabyrinthShoppingSessionIntegrationTest {
                 assertFalse(fixture.types().contains("shop.purchase_confirm_prepared"))
             } finally { fixture.stop() }
         }
+    }
+
+    @Test fun `买按钮点下后游戏仍停在商店页的过渡帧不作废预算证据`() = runBlocking {
+        val fixture = Fixture(temp.newFolder())
+        try {
+            fixture.start(); fixture.buy()
+            // 手势还没落地，游戏仍是商店页：这一帧属于同一次购买的过渡，不是预算证据失效。
+            assertTrue(fixture.observe(stock()))
+            assertNotNull(fixture.get("shoppingPurchaseLease"))
+            assertEquals("购买意图已保存，等待同一商品确认弹窗；禁止新购", fixture.session.state.value.message)
+            fixture.confirm()
+            assertEquals(2, fixture.taps.get())
+            assertEquals("shop.purchase_confirm_dispatched", fixture.types().last())
+        } finally { fixture.stop() }
+    }
+
+    @Test fun `确认弹窗遮住背景商品时仍按弹窗图标核对意图`() = runBlocking {
+        val fixture = Fixture(temp.newFolder())
+        try {
+            fixture.start(); fixture.buy()
+            // 真实识别在弹窗打开时仍列出被遮罩的背景商品：价格与标题都读不出，遗物图标也不再可信。
+            val covered = item.copy(categoryState = LabyrinthShopCategoryState.EXHAUSTED, priceRead = null,
+                titleText = null, relicMatch = item.relicMatch!!.copy(relicId = null, displayName = null))
+            val dialog = frame(LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION,
+                LabyrinthShopObservation(listOf(covered, covered.copy(slotId = "slot-2")),
+                    LabyrinthShopDialogState.PURCHASE_CONFIRMATION, purchaseCandidate = item.relicMatch))
+            assertFalse(fixture.observe(dialog))
+            assertNotNull(fixture.get("shoppingPurchaseLease"))
+            fixture.dispatch(LabyrinthPostEntryActionKind.SHOP_CONFIRM_RELIC, item.relicMatch!!.relicId)
+            fixture.awaitIdle()
+            assertEquals(2, fixture.taps.get())
+            assertEquals("shop.purchase_confirm_dispatched", fixture.types().last())
+        } finally { fixture.stop() }
+    }
+
+    @Test fun `刷新确认框出现前的过渡帧不作废刷新证据`() = runBlocking {
+        val fixture = Fixture(temp.newFolder())
+        try {
+            fixture.start(); fixture.openRefresh()
+            // 点下刷新后游戏先停在商店页，刷新证据必须跨过这一两帧。
+            assertFalse(fixture.observe(refreshStock()))
+            assertNotNull(fixture.get("shoppingRefreshEvidence"))
+            // 刷新确认框与退出确认同版；证据在这一页同样必须保留。
+            val dialog = frame(LabyrinthEntryPageState.SHOP_EXIT_CONFIRMATION,
+                LabyrinthShopObservation(emptyList(), LabyrinthShopDialogState.EXIT_CONFIRMATION))
+            assertFalse(fixture.observe(dialog))
+            assertNotNull(fixture.get("shoppingRefreshEvidence"))
+            fixture.dispatch(LabyrinthPostEntryActionKind.SHOP_CONFIRM_REFRESH); fixture.awaitIdle()
+            assertEquals(2, fixture.taps.get())
+            assertEquals("shop.refresh_dispatched", fixture.types().last())
+            assertEquals(1, fixture.types().count { it == "shop.refresh_prepared" })
+            assertNull(fixture.get("shoppingRefreshEvidence"))
+        } finally { fixture.stop() }
+    }
+
+    @Test fun `刷新待确认时出现购买确认框会作废刷新证据`() = runBlocking {
+        val fixture = Fixture(temp.newFolder())
+        try {
+            fixture.start(); fixture.openRefresh()
+            assertNotNull(fixture.get("shoppingRefreshEvidence"))
+            fixture.observe(frame(LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION,
+                LabyrinthShopObservation(emptyList(), LabyrinthShopDialogState.PURCHASE_CONFIRMATION)))
+            assertNull(fixture.get("shoppingRefreshEvidence"))
+            fixture.dispatch(LabyrinthPostEntryActionKind.SHOP_CONFIRM_REFRESH); fixture.awaitIdle()
+            assertEquals(1, fixture.taps.get())
+            assertFalse(fixture.types().contains("shop.refresh_dispatched"))
+        } finally { fixture.stop() }
     }
 
     @Test fun `刷新预算lease过期或离开过渡页不复用旧价格PNG`() = runBlocking {
@@ -859,13 +934,14 @@ class LabyrinthShoppingSessionIntegrationTest {
         val fixture = Fixture(temp.newFolder())
         var ocrNow = 0L
         val reads = LabyrinthShopReceiptReadState { ocrNow }
+        fun row(index: Int) = EntryPixelRect(20, index * LABYRINTH_SHOP_RECEIPT_COLLAGE_ROW_HEIGHT + 40, 600, 60)
         val lines = listOf(
-            LabyrinthShopOcrLine("购买完成", EntryPixelRect(850, 270, 200, 40)),
-            LabyrinthShopOcrLine("消耗阿尔法金币×100", EntryPixelRect(650, 390, 300, 30)),
-            LabyrinthShopOcrLine("购买了${item.relicMatch!!.displayName}。", EntryPixelRect(600, 445, 300, 30)),
-            LabyrinthShopOcrLine("1000", EntryPixelRect(1000, 590, 100, 35)),
-            LabyrinthShopOcrLine("900", EntryPixelRect(1270, 590, 100, 35)),
-            LabyrinthShopOcrLine("确认", EntryPixelRect(900, 725, 80, 30)))
+            LabyrinthShopOcrLine("购买完成", row(0)),
+            LabyrinthShopOcrLine("消耗阿尔法金币×100", row(1)),
+            LabyrinthShopOcrLine("购买了${item.relicMatch!!.displayName}。", row(2)),
+            LabyrinthShopOcrLine("1000", row(3)),
+            LabyrinthShopOcrLine("900", row(4)),
+            LabyrinthShopOcrLine("确认", row(5)))
         val button = EntryPixelRect(780, 710, 360, 65)
         try {
             fixture.start(); fixture.buy(); fixture.confirm()

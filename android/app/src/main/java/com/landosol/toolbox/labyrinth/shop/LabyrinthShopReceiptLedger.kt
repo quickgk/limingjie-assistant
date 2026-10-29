@@ -10,7 +10,7 @@ import kotlinx.serialization.json.*
 class LabyrinthShopReceiptLedger(private val store: LabyrinthShoppingJournal) {
     fun record(run: LabyrinthShoppingJournal.Run, receipt: LabyrinthShopPurchaseReceiptObservation,
         nodeId: Long?, floor: Int?, now: Long, encode: (FileOutputStream) -> Boolean): ReceiptCommit = synchronized(store.lock) {
-        check(receipt.verified) { "购买回执尚未通过独立双读、金额与确认按钮校验" }
+        check(receipt.verified) { "购买回执尚未通过独立双读与金额校验" }
         val events = store.read(run)
         val key = "purchase-" + LabyrinthShoppingJournal.key("${run.runId}|$nodeId|${fingerprint(receipt)}")
         events.firstOrNull { id(it) == key }?.let {
@@ -168,14 +168,14 @@ class LabyrinthShopReceiptLedger(private val store: LabyrinthShoppingJournal) {
                 saved["evidence_id"]?.jsonPrimitive?.longOrNull ?: return null,
                 saved["confirmations"]?.jsonPrimitive?.intOrNull ?: return null)
         }
-        // 入账时已验证按钮矩形；恢复只核对已保存独立读数和原图，不重新授权屏幕点击。
+        // 恢复只核对已保存的独立读数与原图；确认按钮的文字不作为交易证据，不参与恢复校验。
         val receipt = LabyrinthShopPurchaseReceiptObservation(read("heading"), read("item"), read("expenditure"),
             read("before"), read("after"), read("button"))
         val spent = receipt.spent
         val before = receipt.before
         check(type(event) == "shop.purchase_completed" && receipt.titleConfirmed && receipt.independentReadsConfirmed &&
             receipt.itemName != null && spent != null && spent > 0 && before != null && before >= spent &&
-            before - spent == receipt.after && receipt.button?.text?.filterNot(Char::isWhitespace) == "确认" &&
+            before - spent == receipt.after &&
             event["verification_status"]?.jsonPrimitive?.contentOrNull == "verified" &&
             event["source"]?.jsonPrimitive?.contentOrNull == "actual_screen" &&
             context["receipt_id"] == event["event_id"] &&

@@ -713,6 +713,36 @@ class LabyrinthEntryRecognitionPolicyTest {
     }
 
     @Test
+    fun `purchase complete receipt dialog is never a session block`() {
+        // 实机回执：回执的「确认」按钮在宽泛的返回标题模板上得 0.65，标题 0.53，此时回执尚未认出。
+        val result = LabyrinthEntryFrameResult(
+            observation = LabyrinthEntryPageObservation(
+                state = LabyrinthEntryPageState.UNKNOWN,
+                confidence = 0.0,
+                stateScores = emptyMap(),
+                anchorScores = LabyrinthAnchorScores(
+                    mapOf(
+                        EntryAnchorId.SHOP_TITLE to 0.99,
+                        EntryAnchorId.SHOP_INSTRUCTION to 1.0,
+                        EntryAnchorId.SHOP_CLOSE to 1.0,
+                        EntryAnchorId.SHOP_PURCHASE_COMPLETE_TITLE to 0.53,
+                        EntryAnchorId.SESSION_ERROR_TITLE to 0.76,
+                        EntryAnchorId.SESSION_RETURN_TITLE to 0.65,
+                    ),
+                ),
+            ),
+            matchedFeatures = emptyList(),
+            elapsedMillis = 1,
+            anchorMatches = mapOf(
+                EntryAnchorId.SESSION_RETURN_TITLE to EntryAnchorMatch(0.65, EntryPixelRect(756, 692, 410, 94)),
+            ),
+            frameWidth = 1920,
+            frameHeight = 1080,
+        )
+        assertEquals(SessionBlockKind.NONE, labyrinthSessionBlockObservation(result).kind)
+    }
+
+    @Test
     fun `return-title button alone cannot trigger session recovery`() {
         val block = labyrinthSessionBlockObservation(
             frameResult(

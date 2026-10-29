@@ -24,7 +24,7 @@ class LabyrinthShopAmountParsingTest {
             .forEach { assertNull(it, LabyrinthShopPurchaseReceiptObservation(expenditure = read(it)).spent) }
     }
 
-    @Test fun `六字段复核还必须满足实际花费余额差额`() {
+    @Test fun `回执复核还必须满足实际花费余额差额`() {
         val receipt = validReceipt()
         assertTrue(receipt.verified)
         assertEquals("苍珠手镯", receipt.itemName)
@@ -37,7 +37,6 @@ class LabyrinthShopAmountParsingTest {
         assertFalse(receipt.copy(item = read("苍珠手镯")).verified)
         assertFalse(receipt.copy(item = read("购买了杖")).verified)
         assertFalse(receipt.copy(heading = read("购买了苍珠手镯")).verified)
-        assertFalse(receipt.copy(button = read("确定")).verified)
         assertFalse(receipt.copy(confirmRect = null).verified)
     }
 
@@ -45,7 +44,7 @@ class LabyrinthShopAmountParsingTest {
         val receipt = validReceipt()
         listOf(receipt.copy(heading = read("购买完成", 1)), receipt.copy(item = read("购买了苍珠手镯。", 1)),
             receipt.copy(expenditure = read("消耗阿尔法金币×1000", 1)), receipt.copy(balanceBefore = read("1000", 1)),
-            receipt.copy(balanceAfter = read("0", 1)), receipt.copy(button = read("确认", 1)))
+            receipt.copy(balanceAfter = read("0", 1)))
             .forEach { assertFalse(it.independentReadsConfirmed); assertFalse(it.verified) }
         assertFalse(LabyrinthShopPurchaseReceiptObservation().verified)
     }

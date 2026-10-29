@@ -102,7 +102,7 @@ class LabyrinthShopOcrReadStateTest {
         assertEquals(1, state.reads["shop_item_1"]?.confirmations)
     }
 
-    @Test fun `回执只有六字段一致的第二次实际回调才能通过`() {
+    @Test fun `回执只有事实一致的第二次实际回调才能通过`() {
         var now = 0L
         val state = LabyrinthShopReceiptReadState { now }
         val first = requireNotNull(state.request(11))
@@ -125,7 +125,7 @@ class LabyrinthShopOcrReadStateTest {
         assertNull(state.request(11))
     }
 
-    @Test fun `回执任一字段漂移都会撤销整个六字段复核`() {
+    @Test fun `回执任一字段漂移都会撤销整个复核`() {
         var now = 0L
         val state = LabyrinthShopReceiptReadState { now }
         state.complete(requireNotNull(state.request(11)), receiptLines(), confirm)
@@ -138,6 +138,24 @@ class LabyrinthShopOcrReadStateTest {
         state.complete(requireNotNull(state.request(11)), changed, confirm)
         assertTrue(requireNotNull(state.receipt).verified)
         assertEquals("防守铠甲", state.receipt?.itemName)
+    }
+
+    @Test fun `字段两端多出的非文字符号不算读数漂移`() {
+        var now = 0L
+        val state = LabyrinthShopReceiptReadState { now }
+        state.complete(requireNotNull(state.request(11)), receiptLines(), confirm)
+        now = 200
+        val noisy = receiptLines().map { line ->
+            when (line.text) {
+                "购买了苍珠手镯。" -> line.copy(text = "|购买了苍珠手镯。|")
+                "1000" -> line.copy(text = "|1000")
+                "900" -> line.copy(text = "900|")
+                else -> line
+            }
+        }
+        state.complete(requireNotNull(state.request(11)), noisy, confirm)
+        assertTrue(requireNotNull(state.receipt).verified)
+        assertEquals("苍珠手镯", state.receipt?.itemName)
     }
 
     @Test fun `回执旧epoch与重复回调不能释放或污染新作业`() {
@@ -160,7 +178,7 @@ class LabyrinthShopOcrReadStateTest {
         assertNull(state.receipt)
     }
 
-    @Test fun `回执OCR失败会释放作业且长时间停留后换尺度重新复核`() {
+    @Test fun `回执OCR失败会释放作业且长时间停留后重新复核`() {
         var now = 0L
         val state = LabyrinthShopReceiptReadState { now }
         state.complete(requireNotNull(state.request(11)), null, confirm)
@@ -174,7 +192,6 @@ class LabyrinthShopOcrReadStateTest {
         assertNull(state.request(11))
         now = 5_400
         val reread = requireNotNull(state.request(11))
-        assertEquals(1, reread.scale)
         assertNull(state.receipt)
         state.complete(reread, receiptLines(), confirm)
         assertFalse(requireNotNull(state.receipt).verified)
@@ -348,12 +365,10 @@ class LabyrinthShopOcrReadStateTest {
         }
     }
 
-    @Test fun `确认标题不绕过金额差额或按钮校验也不回退到底层页面`() {
+    @Test fun `确认标题不绕过金额差额也不回退到底层页面`() {
         val badAmount = receiptLines().map { if (it.text == "900") it.copy(text = "901") else it }
         val badDigits = receiptLines().map { if (it.text == "1000") it.copy(text = "1O00") else it }
-        val badButton = receiptLines().map { if (it.text == "确认") it.copy(text = "关闭") else it }
-        listOf(badAmount to confirm, badDigits to confirm, badButton to confirm,
-            receiptLines() to confirm.copy(left = 900)).forEach { (lines, rect) ->
+        listOf(badAmount to confirm, badDigits to confirm, receiptLines() to null).forEach { (lines, rect) ->
             var now = 0L
             val state = LabyrinthShopReceiptReadState { now }
             state.complete(requireNotNull(state.request(11)), lines, rect)
@@ -374,12 +389,15 @@ class LabyrinthShopOcrReadStateTest {
         LabyrinthShopOcrLine(text, EntryPixelRect(index % 3 * 500 + 25, index / 3 * 180 + 25, 200, 40))
     }
 
+    private fun receiptRow(index: Int, left: Int = 20) =
+        EntryPixelRect(left, index * LABYRINTH_SHOP_RECEIPT_COLLAGE_ROW_HEIGHT + 40, 600, 60)
+
     private fun receiptLines(item: String = "购买了苍珠手镯。") = listOf(
-        LabyrinthShopOcrLine("购买完成", EntryPixelRect(850, 270, 200, 40)),
-        LabyrinthShopOcrLine("消耗阿尔法金币×100", EntryPixelRect(650, 390, 300, 30)),
-        LabyrinthShopOcrLine(item, EntryPixelRect(600, 445, 300, 30)),
-        LabyrinthShopOcrLine("1000", EntryPixelRect(1000, 590, 100, 35)),
-        LabyrinthShopOcrLine("900", EntryPixelRect(1270, 590, 100, 35)),
-        LabyrinthShopOcrLine("确认", EntryPixelRect(900, 725, 80, 30)),
+        LabyrinthShopOcrLine("购买完成", receiptRow(0)),
+        LabyrinthShopOcrLine("消耗阿尔法金币×100", receiptRow(1)),
+        LabyrinthShopOcrLine(item, receiptRow(2)),
+        LabyrinthShopOcrLine("1000", receiptRow(3)),
+        LabyrinthShopOcrLine("900", receiptRow(4)),
+        LabyrinthShopOcrLine("确认", receiptRow(5)),
     )
 }
