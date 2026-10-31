@@ -147,4 +147,23 @@ class LabyrinthShopCategoryResolutionTest {
         val tie = decide(listOf(second, random), area = 5) as LabyrinthShopDecision.BuyRoleImprint
         assertEquals("2", tie.item.slotId)
     }
+
+    @Test fun `title with a lost leading glyph is read as its unique role`() {
+        val reading = resolver.resolve(item(), "扰型职能的随机印记", 1, 0)
+        assertEquals(LabyrinthShopItemKind.ROLE_IMPRINT, reading.kind)
+        assertEquals("干扰型职能印记", reading.roleImprintLabel)
+        assertEquals(LabyrinthShopCategoryState.READY, reading.categoryState)
+        assertTrue(decide(listOf(reading), area = 5) is LabyrinthShopDecision.BuyRoleImprint)
+    }
+
+    @Test fun `an imprint without a resolvable role retries and then stops blocking the shop`() {
+        val waiting = resolver.resolve(item(), "职能的随机印记", 2, 0)
+        assertEquals(LabyrinthShopItemKind.ROLE_IMPRINT, waiting.kind)
+        assertNull(waiting.roleImprintLabel)
+        assertEquals(LabyrinthShopCategoryState.READING, waiting.categoryState)
+        assertTrue(decide(listOf(waiting), area = 5) is LabyrinthShopDecision.Wait)
+        val exhausted = resolver.resolve(item(), "职能的随机印记", 2, 3)
+        assertEquals(LabyrinthShopCategoryState.EXHAUSTED, exhausted.categoryState)
+        assertTrue(decide(listOf(exhausted), area = 5) is LabyrinthShopDecision.Close)
+    }
 }

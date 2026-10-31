@@ -125,6 +125,44 @@ class LabyrinthShopOcrReadStateTest {
         assertNull(state.request(11))
     }
 
+    @Test fun `回执六行原文一直可以在调试诊断里查到`() {
+        var now = 0L
+        val state = LabyrinthShopReceiptReadState { now }
+        assertNull(state.diagnostics())
+        val bad = receiptLines().map { if (it.text == "购买完成") it.copy(text = "商店") else it }
+        state.complete(requireNotNull(state.request(11)), bad, confirm)
+        val rejected = requireNotNull(state.diagnostics())
+        assertEquals("NOT_RECEIPT", rejected.status)
+        assertEquals("购买完成标题未核实", rejected.reviewReason)
+        assertEquals("商店", rejected.heading)
+        assertEquals("购买了苍珠手镯。", rejected.item)
+        assertEquals("消耗阿尔法金币×100", rejected.expenditure)
+        assertEquals("1000", rejected.balanceBefore)
+        assertEquals("900", rejected.balanceAfter)
+        now = 200
+        state.complete(requireNotNull(state.request(11)), receiptLines(), confirm)
+        val waiting = requireNotNull(state.diagnostics())
+        assertEquals("PURCHASE_COMPLETE", waiting.status)
+        assertEquals("购买完成", waiting.heading)
+        assertEquals("等待各区域独立OCR复核", waiting.reviewReason)
+        now = 400
+        state.complete(requireNotNull(state.request(11)), receiptLines(), confirm)
+        assertEquals(null, requireNotNull(state.diagnostics()).reviewReason)
+        // 单独记录的引擎读数只进诊断，不影响判定。
+        assertNull(requireNotNull(state.diagnostics()).paddle)
+        state.markPaddleRunning("ppocr_v5_mobile_rec")
+        val running = requireNotNull(requireNotNull(state.diagnostics()).paddle)
+        assertEquals("running", running.status)
+        assertEquals("ppocr_v5_mobile_rec", running.model)
+        state.setPaddle(listOf("购买完毕", "消耗阿尔法金币×100", "购买了苍珠手镯。", "1000", "900", "确认"))
+        val paddle = requireNotNull(requireNotNull(state.diagnostics()).paddle)
+        assertEquals("ok", paddle.status)
+        assertEquals("购买了苍珠手镯。", paddle.item)
+        assertNull(requireNotNull(state.diagnostics()).reviewReason)
+        state.setPaddle(listOf(null, null, null, null, null, null))
+        assertEquals("unavailable", requireNotNull(requireNotNull(state.diagnostics()).paddle).status)
+    }
+
     @Test fun `回执任一字段漂移都会撤销整个复核`() {
         var now = 0L
         val state = LabyrinthShopReceiptReadState { now }

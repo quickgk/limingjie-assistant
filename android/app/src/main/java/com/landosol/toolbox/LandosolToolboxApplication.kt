@@ -226,6 +226,7 @@ class LandosolToolboxApplication : Application() {
         LabyrinthDebugDashboardServer(
             frameArchiveDirectory = java.io.File(cacheDir, "labyrinth-frame-archive"),
             runtimeDiagnostics = com.landosol.toolbox.labyrinth.debug.LabyrinthRuntimeDiagnostics(this),
+            appContext = this,
         ).also { server ->
             server.start()
         }

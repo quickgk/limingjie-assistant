@@ -14,6 +14,14 @@ class LabyrinthShopItemTextTest {
         assertFalse(LabyrinthShopItemText.looksLikeRoleImprint("未知型识能的随机印记"))
         assertFalse(LabyrinthShopItemText.looksLikeRoleImprint("增益型识能的随机"))
     }
+
+    @Test fun `imprint title tolerates an inserted glyph and the增 variant`() {
+        // 实机商店标题原样：增益被读成「増益」，且「型」后插入了一个「取」。
+        assertEquals("增益型职能印记", LabyrinthShopItemText.roleImprintLabel("増益型取职能的随机印记"))
+        assertEquals("增益型职能印记", LabyrinthShopItemText.roleImprintLabel("增益型职熊的随机印记"))
+        assertEquals("增益型职能印记", LabyrinthShopItemText.roleImprintLabel("增益型识职能的选择印记"))
+        assertEquals("增益型职能印记", LabyrinthShopItemText.roleImprintLabel("増益型职能的随机印记"))
+    }
     @Test
     fun `shop role imprint titles are separated from relics`() {
         assertEquals(
@@ -71,5 +79,14 @@ class LabyrinthShopItemTextTest {
         // Relic titles are never imprints of either kind.
         assertFalse(LabyrinthShopItemText.isChoiceRoleImprint("苍珠手镯"))
         assertFalse(LabyrinthShopItemText.isChoiceRoleImprint(null))
+    }
+
+    @Test fun `title tolerates a lost leading glyph only when the role stays unique`() {
+        assertEquals("干扰型职能印记", LabyrinthShopItemText.roleImprintLabel("扰型职能的随机印记"))
+        assertEquals("攻击型职能印记", LabyrinthShopItemText.roleImprintLabel("击型职能的随机印记"))
+        assertEquals("治疗型职能印记", LabyrinthShopItemText.roleImprintLabel("疗型职能的选择印记"))
+        // 增益/减益同尾字：宁可判不出，也不猜成另一个角色。
+        assertNull(LabyrinthShopItemText.roleImprintLabel("益型职能的随机印记"))
+        assertNull(LabyrinthShopItemText.roleImprintLabel("圣减术次元战裙"))
     }
 }

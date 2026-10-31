@@ -1,6 +1,9 @@
 package com.landosol.toolbox.labyrinth.debug
 
+import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.os.SystemClock
 import android.util.Log
 import com.landosol.toolbox.AppVersion
 import com.landosol.toolbox.automation.overlay.AutomationOverlayPresentation
@@ -8,6 +11,7 @@ import com.landosol.toolbox.labyrinth.LabyrinthEntryRecognitionSessionState
 import com.landosol.toolbox.labyrinth.LabyrinthEventChoiceDecision
 import com.landosol.toolbox.labyrinth.vision.EntryPixelRect
 import com.landosol.toolbox.labyrinth.vision.LabyrinthEntryFrameResult
+import com.landosol.toolbox.labyrinth.vision.PaddleTextDetector
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
@@ -39,6 +43,8 @@ class LabyrinthDebugDashboardServer(
     /** Directory for the optional per-frame archive; null disables the feature entirely. */
     private val frameArchiveDirectory: File? = null,
     private val runtimeDiagnostics: LabyrinthRuntimeDiagnostics? = null,
+    /** 整屏 OCR 需要 Context 解 assets 里的模型；为 null 时 /api/ocr 只报不可用。 */
+    private val appContext: Context? = null,
 ) {
     private data class Snapshot(
         val json: ByteArray,
@@ -211,6 +217,7 @@ class LabyrinthDebugDashboardServer(
                 if (line.isEmpty()) break
             }
             val path = requestLine.split(' ').getOrNull(1)?.substringBefore('?') ?: "/"
+            val query = requestLine.split(' ').getOrNull(1)?.substringAfter('?', "") ?: ""
             when (path) {
                 "/", "/index.html" -> respond(output, "text/html; charset=utf-8", DASHBOARD_HTML)
                 "/api/state" -> respond(output, "application/json; charset=utf-8", latest.get().json)
@@ -223,6 +230,7 @@ class LabyrinthDebugDashboardServer(
                     respond(output, "application/json; charset=utf-8", archiveStatusJson())
                 }
                 "/api/archive" -> respond(output, "application/json; charset=utf-8", archiveStatusJson())
+                "/api/ocr" -> respond(output, "application/json; charset=utf-8", screenOcrJson(query))
                 "/logs.zip", "/download/logs.zip" -> {
                     val snapshot = latest.get()
                     val history = synchronized(historyLock) { recentStates.toList() }
@@ -292,6 +300,91 @@ class LabyrinthDebugDashboardServer(
         put("enabled", frameArchiveEnabled.get())
         put("frames", archivedFramesSnapshot().size)
     }.toString()
+
+    /** 整屏 OCR 引擎，首次调用 /api/ocr 时才创建（解模型有开销）。 */
+    @Volatile
+    private var screenOcr: PaddleTextDetector? = null
+
+    /** 按 frameVersion 缓存，浏览器反复刷新不会重复推理。 */
+    @Volatile
+    private var screenOcrCache: Pair<Long, String>? = null
+
+    /**
+     * `/api/ocr`：对最新一帧跑 det + rec，返回每行的四点框、文本与置信度。
+     *
+     * `?file=<name>` 改为回放 `files/ocr-replay/<name>`，用于游戏维护/无法捕获时用离线帧
+     * 验证同一条链路；此时不读写实时帧缓存。
+     *
+     * 推理在 HTTP 处理线程上同步执行（单帧约百毫秒级），期间其它请求会被挡住；
+     * 这是调试端点的取舍，正式流程不应走这里。
+     */
+    private fun screenOcrJson(query: String): String {
+        val context = appContext
+            ?: return JSONObject().put("status", "no-context").toString()
+        val replayName = query.split('&')
+            .firstOrNull { it.startsWith("file=") }
+            ?.removePrefix("file=")
+            ?.takeIf { it.isNotBlank() }
+
+        val jpeg: ByteArray
+        var frameVersion = -1L
+        var source = "live"
+        if (replayName != null) {
+            if (replayName.contains('/') || replayName.contains('\\') || replayName.contains("..")) {
+                return JSONObject().put("status", "bad-name").toString()
+            }
+            val file = File(File(context.filesDir, REPLAY_DIR), replayName)
+            if (!file.isFile) return JSONObject().put("status", "no-file").toString()
+            jpeg = runCatching { file.readBytes() }
+                .getOrElse { return JSONObject().put("status", "read-failed").toString() }
+            source = "replay:$replayName"
+        } else {
+            val snapshot = latest.get()
+            screenOcrCache?.let { cached ->
+                if (cached.first == snapshot.frameVersion) return cached.second
+            }
+            jpeg = snapshot.jpeg ?: return JSONObject().put("status", "no-frame").toString()
+            frameVersion = snapshot.frameVersion
+        }
+
+        val started = SystemClock.elapsedRealtime()
+        val bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
+            ?: return JSONObject().put("status", "decode-failed").toString()
+        val engine = screenOcr ?: PaddleTextDetector(context).also { screenOcr = it }
+        val lines = try {
+            engine.detect(bitmap)
+        } finally {
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+        val elapsed = SystemClock.elapsedRealtime() - started
+        val json = JSONObject().apply {
+            put("status", if (lines == null) "unavailable" else "ok")
+            put("model", engine.modelName)
+            put("minScore", engine.minLineScore.toDouble())
+            put("source", source)
+            put("frameVersion", frameVersion)
+            put("elapsedMs", elapsed)
+            put("lineCount", lines?.size ?: 0)
+            put("lines", JSONArray().apply {
+                lines.orEmpty().forEach { line ->
+                    put(JSONObject().apply {
+                        put("text", line.text)
+                        put("score", line.score.toDouble())
+                        put("box", JSONArray().apply {
+                            line.box.forEach { point ->
+                                put(JSONArray().apply {
+                                    put(point.x.toDouble())
+                                    put(point.y.toDouble())
+                                })
+                            }
+                        })
+                    })
+                }
+            })
+        }.toString()
+        if (source == "live") screenOcrCache = frameVersion to json
+        return json
+    }
 
     private fun buildDiagnosticZip(
         snapshot: Snapshot,
@@ -417,6 +510,35 @@ class LabyrinthDebugDashboardServer(
         put("page", result.observation.state.name)
         put("pageConfidence", result.observation.confidence)
         put("pageReason", result.observation.reason ?: JSONObject.NULL)
+        fun engineReadJson(read: com.landosol.toolbox.labyrinth.vision.LabyrinthShopReceiptPaddleRead?): Any =
+            read?.let { engine ->
+                JSONObject().apply {
+                    put("status", engine.status)
+                    put("model", engine.model ?: JSONObject.NULL)
+                    put("heading", engine.heading ?: JSONObject.NULL)
+                    put("expenditure", engine.expenditure ?: JSONObject.NULL)
+                    put("item", engine.item ?: JSONObject.NULL)
+                    put("balanceBefore", engine.balanceBefore ?: JSONObject.NULL)
+                    put("balanceAfter", engine.balanceAfter ?: JSONObject.NULL)
+                    put("button", engine.button ?: JSONObject.NULL)
+                }
+            } ?: JSONObject.NULL
+        put("shopReceiptOcr", result.shopReceiptOcr?.let { diagnostic ->
+            JSONObject().apply {
+                put("status", diagnostic.status)
+                put("reason", diagnostic.reviewReason ?: JSONObject.NULL)
+                put("heading", diagnostic.heading ?: JSONObject.NULL)
+                put("item", diagnostic.item ?: JSONObject.NULL)
+                put("expenditure", diagnostic.expenditure ?: JSONObject.NULL)
+                put("balanceBefore", diagnostic.balanceBefore ?: JSONObject.NULL)
+                put("balanceAfter", diagnostic.balanceAfter ?: JSONObject.NULL)
+                put("button", diagnostic.button ?: JSONObject.NULL)
+                put("confirmations", diagnostic.confirmations ?: JSONObject.NULL)
+                put("primaryEngine", diagnostic.primaryEngine ?: JSONObject.NULL)
+                put("paddle", engineReadJson(diagnostic.paddle))
+                put("mlkit", engineReadJson(diagnostic.mlkit))
+            }
+        } ?: JSONObject.NULL)
         fun rectJson(rect: EntryPixelRect?): Any = rect?.let {
             JSONObject().apply {
                 put("left", it.left)
@@ -740,6 +862,8 @@ class LabyrinthDebugDashboardServer(
         const val LOG_TAG = "LabyrinthDebugHttp"
         const val IPV4_LOOPBACK = "127.0.0.1"
         const val DEFAULT_PORT = 8765
+        /** 离线回放目录：`files/ocr-replay`，由调试者自己 adb 推图进去。 */
+        const val REPLAY_DIR = "ocr-replay"
         const val JPEG_QUALITY = 68
         const val JPEG_REFRESH_INTERVAL_MILLIS = 750L
         const val FRAME_ARCHIVE_WIDTH = 960
@@ -767,7 +891,7 @@ class LabyrinthDebugDashboardServer(
               </style>
             </head>
             <body>
-              <header><strong>黎明界实时分析</strong><span class="pill">${AppVersion.label}</span><span class="pill" id="status">等待数据</span><span class="pill" id="page">-</span><span class="muted" id="stamp"></span><a class="pill action" href="/logs.zip">下载日志 ZIP</a><a class="pill action" href="#" id="archiveToggle">逐帧归档：读取中</a></header>
+              <header><strong>黎明界实时分析</strong><span class="pill">${AppVersion.label}</span><span class="pill" id="status">等待数据</span><span class="pill" id="page">-</span><span class="muted" id="stamp"></span><a class="pill action" href="/logs.zip">下载日志 ZIP</a><a class="pill action" href="/api/ocr" target="_blank">整屏 OCR</a><a class="pill action" href="#" id="archiveToggle">逐帧归档：读取中</a></header>
               <main class="grid">
                 <section class="card"><div class="frameWrap" id="frameWrap"><img id="frame" alt="latest frame"></div></section>
                 <section class="stack">

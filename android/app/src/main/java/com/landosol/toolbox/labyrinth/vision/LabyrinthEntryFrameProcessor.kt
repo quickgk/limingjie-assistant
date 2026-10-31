@@ -376,6 +376,8 @@ data class LabyrinthEntryFrameResult(
     val relicChoiceSelection: LabyrinthRelicChoiceObservation? = null,
     val eventChoiceSelection: LabyrinthEventChoiceObservation? = null,
     val eventOcrDiagnostics: LabyrinthEventOcrDiagnostics? = null,
+    /** 回执六行读数与判定；回执没读成或还在读时同样记录，只进调试状态。 */
+    val shopReceiptOcr: LabyrinthShopReceiptOcrDiagnostics? = null,
     val nodeRelicStackObservation: LabyrinthNodeRelicStackObservation? = null,
     val relicDetailObservation: LabyrinthRelicDetailObservation? = null,
     val shopObservation: LabyrinthShopObservation? = null,

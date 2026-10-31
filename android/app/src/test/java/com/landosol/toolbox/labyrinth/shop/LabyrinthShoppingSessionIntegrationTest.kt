@@ -468,6 +468,7 @@ class LabyrinthShoppingSessionIntegrationTest {
             fixture.awaitIdle()
             assertTrue(fixture.session.state.value.running)
             // 再 +100 秒（累计 200 秒）回到 UNKNOWN：额度已经用掉，必须停止。
+            // 悬空意图的兜底作废期限是 240 秒，晚于这里的 180 秒停止，所以保守策略仍然优先。
             fixture.now += 100_000
             assertTrue(fixture.observe(frame(LabyrinthEntryPageState.UNKNOWN)))
             fixture.awaitIdle()

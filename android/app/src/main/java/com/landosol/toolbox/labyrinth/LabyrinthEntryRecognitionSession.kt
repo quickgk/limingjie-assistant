@@ -59,6 +59,8 @@ import com.landosol.toolbox.labyrinth.node.NodeSessionState
 import com.landosol.toolbox.labyrinth.node.NodeTemplateSet
 import android.graphics.Bitmap
 import com.landosol.toolbox.labyrinth.shop.LabyrinthShoppingJournal
+import com.landosol.toolbox.labyrinth.shop.LabyrinthShopItemName
+import com.landosol.toolbox.labyrinth.shop.LabyrinthShoppingIntentGuard
 import com.landosol.toolbox.labyrinth.shop.LabyrinthShoppingModule
 import com.landosol.toolbox.labyrinth.shop.PendingOwnership
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopReceiptRead
@@ -73,6 +75,7 @@ import com.landosol.toolbox.labyrinth.vision.LabyrinthShopPurchaseReceiptObserva
 import java.io.ByteArrayOutputStream
 import java.io.FileOutputStream
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.intOrNull
@@ -3353,10 +3356,18 @@ class LabyrinthEntryRecognitionSession(
             shop?.refreshPriceRead == null || shop.verifiedRefreshPrice == lease.price
         } else context != null && (liveItems.isEmpty() || liveItems.singleOrNull {
             it.slotId == context["slot_id"]?.jsonPrimitive?.contentOrNull
-        }?.let { item -> (item.verifiedPrice == null || item.verifiedPrice == lease.price) &&
-            (item.relicMatch?.displayName ?: item.titleText)?.filterNot(Char::isWhitespace) == context["item_name"]?.jsonPrimitive?.contentOrNull &&
-            item.relicMatch?.relicId == context["item_id"]?.jsonPrimitive?.contentOrNull &&
-            item.roleImprintLabel == context["role_label"]?.jsonPrimitive?.contentOrNull } == true)
+        }?.let { item ->
+            // 印记的身份是「职能 + 选择/随机」，由 role_label 与标题派生；标题原文 OCR 会抖
+            // （实测「干扰型职能的选择印记」被读成「扰型职能的选择印记」），拿它比对会把有效预算作废，
+            // 确认弹窗随即变成「预算证据已失效」而卡死。遗物则用归一比较，容忍简繁差异。
+            val nameMatches = context["item_kind"] == JsonPrimitive("role_imprint") ||
+                LabyrinthShopItemName.equal(context["item_name"]?.jsonPrimitive?.contentOrNull,
+                    item.relicMatch?.displayName ?: item.titleText)
+            (item.verifiedPrice == null || item.verifiedPrice == lease.price) &&
+                nameMatches &&
+                item.relicMatch?.relicId == context["item_id"]?.jsonPrimitive?.contentOrNull &&
+                item.roleImprintLabel == context["role_label"]?.jsonPrimitive?.contentOrNull
+        } == true)
         val candidate = shop?.purchaseCandidate
         val candidateMatches = candidate == null || (context != null && candidate.recognized &&
             candidate.relicId == context["item_id"]?.jsonPrimitive?.contentOrNull &&
@@ -3479,7 +3490,30 @@ class LabyrinthEntryRecognitionSession(
                 shoppingRefreshEvidence = null
             module.pendingOwnership().firstOrNull()?.let { return commitShoppingOwnership(sessionId, it, now) }
             val events = shoppingEvents()
-            val pending = shoppingPendingIntent(events)
+            var pending = shoppingPendingIntent(events)
+            val pendingAge = pending?.let { LabyrinthShoppingIntentGuard.ageMillis(it, now) }
+            // 待决意图必须有回收出口，否则会永久悬空，把之后每个商店页与 UNKNOWN 页都拦成人工控制。
+            // 两个出口：超时（购买已交回人工）、节点/层已变化（这次购买不可能还在这张图上）。
+            // cancelIntent 在「确认已 prepared 或已派发」时会拒绝，此时必须继续等回执，不能清。
+            val abandonReason = pending?.let { intent ->
+                when {
+                    LabyrinthShoppingIntentGuard.shouldAbandon(pendingAge) -> "超时 ${pendingAge}ms"
+                    LabyrinthShoppingIntentGuard.movedAway(intent, shoppingNodeId(), shoppingFloor()) ->
+                        "节点或层已变化（意图 node=${intent["node_id"]} floor=${intent["floor"]}，" +
+                            "当前 node=${shoppingNodeId()} floor=${shoppingFloor()}）"
+                    else -> null
+                }
+            }
+            if (pending != null && abandonReason != null) {
+                val cancelled = runCatching { module.cancelIntent(now) }.isSuccess
+                if (cancelled) {
+                    Log.i(SHOPPING_LOG_TAG, "购买意图作废（$abandonReason），交回人工继续流程")
+                    clearPlannedShopPurchase()
+                    shoppingPurchaseLease = null
+                    pending = null
+                    shoppingError = null
+                }
+            }
             if (pending != null) {
                 val context = shoppingEventPayload(pending)
                 plannedShopPurchaseRelicId = context["item_id"]?.jsonPrimitive?.contentOrNull
@@ -10016,7 +10050,10 @@ class LabyrinthEntryRecognitionSession(
                     add("系列记录：" + relicMarkStackCalibration.entries.joinToString("、") { "${it.key.label}${it.value}" })
                 }
                 if (relicStackLedger.needsAudit) {
-                    add("地图数字与记录冲突，保留已确认值；可打开系列效果一览核对，不阻塞路线")
+                    add(
+                        "地图数字与记录冲突：" + relicStackLedger.conflictSummary() +
+                            "；连续3帧读数一致后按地图纠正，否则保留已确认值，不阻塞路线",
+                    )
                 }
                 current.observedRelics
                     .takeIf(List<LabyrinthObservedRelic>::isNotEmpty)
@@ -10612,6 +10649,7 @@ class LabyrinthEntryRecognitionSession(
         const val NODE_LOG_TAG = "LabyrinthNode"
         const val TEAM_RECOMMENDATION_LOG_TAG = "LabyrinthTeamPlan"
         const val TEAM_SELECTION_PLAN_LOG_TAG = "LabyrinthTeamSelection"
+        const val SHOPPING_LOG_TAG = "LabyrinthShopping"
         const val OWNER = "labyrinth-entry-recognition"
 
         // Matches the capture cadence (MediaProjectionCaptureService.FRAME_INTERVAL_MILLIS = 300).

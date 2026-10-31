@@ -218,7 +218,7 @@ class LabyrinthShopReceiptLedger(private val store: LabyrinthShoppingJournal) {
                 LabyrinthShopItemText.roleImprintLabel(name) == label &&
                     LabyrinthShopItemText.isChoiceRoleImprint(name) ==
                     (context["choice_imprint"]?.jsonPrimitive?.booleanOrNull == true)
-            } else context["item_name"]?.jsonPrimitive?.contentOrNull?.filterNot(Char::isWhitespace) == name
+            } else LabyrinthShopItemName.equal(context["item_name"]?.jsonPrimitive?.contentOrNull, name)
         }
 
         internal fun fingerprint(receipt: LabyrinthShopPurchaseReceiptObservation): String =

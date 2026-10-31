@@ -354,7 +354,7 @@ class AndroidLabyrinthEntryFrameProcessor private constructor(
                         AndroidLabyrinthEventRecognitionDataLoader(context).load(),
                     )
                 }.getOrNull(),
-                shopItemResolver = AndroidLabyrinthShopItemResolver(),
+                shopItemResolver = AndroidLabyrinthShopItemResolver(paddle = PaddleReceiptOcr(context)),
                 roleRewardNameResolver = AndroidLabyrinthRoleRewardNameResolver(
                     names = characterTemplates.map {
                         LabyrinthCharacterNameCandidate(it.characterId, it.displayName, it.aliases)

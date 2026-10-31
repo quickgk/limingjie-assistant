@@ -64,11 +64,12 @@ object LabyrinthShopItemText {
         .replace('記', '记')
         .replace('紀', '记')
         .replace('纪', '记')
+        .replace('増', '增')
         .let { value ->
             // A single substitution is allowed only inside a complete, known imprint title.
             // Do not globally replace OCR characters in ordinary relic names.
             roleLabels.fold(value) { result, role ->
-                result.replace(Regex("${role}型(?:[职识職取][能]|职.)的?(随机|选择)印记")) { match ->
+                result.replace(Regex("${role}型(?:[取识職]?职能|[职识職取][能]|职.)的?(随机|选择)印记")) { match ->
                     "${role}型职能的${match.groupValues[1]}印记"
                 }
             }
@@ -102,12 +103,21 @@ object LabyrinthShopItemText {
         return value.contains("选择")
     }
 
+    /**
+     * 标题 OCR 偶尔吞掉角色名的第一个字（干扰型 → 扰型）。只有剩余片段唯一指向一个角色时才认；
+     * 「增益/减益」这类同尾字的角色宁可判不出，也不猜成另一个。
+     */
+    private fun roleWithLostLeadingGlyph(value: String): String? =
+        roleLabels.filter { label ->
+            label.length > 1 && (value.contains(label.drop(1) + "型职能") || value.contains(label.drop(1) + "职能"))
+        }.singleOrNull()
+
     fun roleImprintLabel(text: String?): String? {
         val normalized = normalized(text)
         if (!looksLikeRoleImprint(normalized)) return null
         val role = roleLabels.firstOrNull { label ->
             normalized.contains("${label}型职能") || normalized.contains("${label}职能")
-        }
+        } ?: roleWithLostLeadingGlyph(normalized)
         if (role != null && (normalized.contains("选择") || normalized.contains("随机"))) {
             return "${role}型职能印记"
         }

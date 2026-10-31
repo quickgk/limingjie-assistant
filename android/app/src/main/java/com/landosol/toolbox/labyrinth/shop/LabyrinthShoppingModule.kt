@@ -53,7 +53,11 @@ class LabyrinthShoppingModule(private val store: LabyrinthShoppingJournal) {
                 it["event_id"] == payload(event)["intent_id"] }
             val context = payload(intent)
             val name = checkNotNull(payload(event)["item_name"]?.jsonPrimitive?.contentOrNull)
-            check(context["item_name"]?.jsonPrimitive?.contentOrNull == name) { "恢复持有精确名称不一致" }
+            // 用归一比较，不用 ==：同一次购买里，商品卡与回执的 OCR 可能一个读「櫻」一个读「樱」，
+            // 而回执提交阶段用的是 LabyrinthShopItemName.equal，这里必须同口径。
+            check(LabyrinthShopItemName.equal(context["item_name"]?.jsonPrimitive?.contentOrNull, name)) {
+                "恢复持有精确名称不一致（意图=${context["item_name"]}，回执=$name）"
+            }
             if (commit.itemId == null) {
                 val label = checkNotNull(LabyrinthShopItemText.roleImprintLabel(name)) { "恢复空持有缺少精确印记身份" }
                 check(context["item_kind"] == JsonPrimitive("role_imprint") && context["item_id"] == JsonNull &&

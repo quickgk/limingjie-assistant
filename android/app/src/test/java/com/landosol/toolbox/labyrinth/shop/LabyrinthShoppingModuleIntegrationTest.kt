@@ -398,6 +398,30 @@ class LabyrinthShoppingModuleIntegrationTest {
         recovered.confirmDispatched(); assertEquals(1, events().count { ShoppingTestData.type(it) == "shop.purchase_completed" })
     }
 
+    /**
+     * 商品卡读「樱」、回执读「櫻」：简繁差异不是身份不一致，必须仍能恢复持有。
+     *
+     * 回执提交阶段用的是 [LabyrinthShopItemName.equal] 归一比较，恢复持有阶段也必须是同一口径。
+     */
+    @Test fun `商品名简繁差异不阻断持有恢复`() {
+        intent(ShoppingTestData.item("樱坚牢战衣"))
+        module.prepareConfirmation(5)
+        val result = accept(ShoppingTestData.receipt("櫻坚牢战衣"))
+        assertEquals("relic-1", result.itemId)
+        val recovered = restart()
+        assertEquals(listOf(PendingOwnership(result, "櫻坚牢战衣", 7, 1)), recovered.pendingOwnership())
+    }
+
+    /** 回执裁图左边缘带出的杂散字符不能让商品名整条解析失败。 */
+    @Test fun `商品名左侧杂散符号仍能解析`() {
+        val noisy = ShoppingTestData.receipt("破守帽退散")
+            .copy(item = ShoppingTestData.read("|购买了破守帽退散。"))
+        assertEquals("破守帽退散", noisy.itemName)
+        val noisyQuote = ShoppingTestData.receipt("破守帽退散")
+            .copy(item = ShoppingTestData.read("“购买了破守帽退散。"))
+        assertEquals("破守帽退散", noisyQuote.itemName)
+    }
+
     @Test fun `manual和只有意图不恢复但精确自动印记恢复空持有事务`() {
         accept(); assertTrue(module.pendingOwnership().isEmpty())
         module.open(1, 101, null, 10)

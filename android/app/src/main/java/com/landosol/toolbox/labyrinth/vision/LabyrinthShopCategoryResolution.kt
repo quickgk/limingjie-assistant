@@ -54,7 +54,9 @@ internal class LabyrinthShopCategoryResolution {
     fun resolve(item: LabyrinthShopItemMatch, text: String?, evidenceId: Long?, attempt: Int): LabyrinthShopItemMatch {
         val imprint = LabyrinthShopItemText.looksLikeRoleImprint(text)
         val label = LabyrinthShopItemText.roleImprintLabel(text)
-        val ready = imprint || (!text.isNullOrBlank() && item.relicMatch?.recognized == true)
+        // 印记必须连角色一起读出来才算确认：只读出「职能…印记」而角色缺失时继续换裁剪重试，
+        // 三次都读不出就按 EXHAUSTED 跳过——既不盲买，也不让整店无限等待。
+        val ready = (imprint && label != null) || (!text.isNullOrBlank() && item.relicMatch?.recognized == true)
         return item.copy(
             kind = when {
                 imprint -> LabyrinthShopItemKind.ROLE_IMPRINT

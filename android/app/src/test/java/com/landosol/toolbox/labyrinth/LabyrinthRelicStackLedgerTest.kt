@@ -70,4 +70,40 @@ class LabyrinthRelicStackLedgerTest {
         observe(1, Source.CHOICE, 10)
         assertEquals(10, ledger.stacks[mark])
     }
+
+    /** 单次地图误读不该让整局都挂着「需核对」：地图后来读回记录值就自行消除。 */
+    @Test fun `地图读数与记录一致后冲突自行消除`() {
+        confirm(9, Source.CHOICE)
+        confirm(1, Source.MAP, firstId = 10)
+        assertTrue(ledger.needsAudit)
+        assertEquals("守备（记录9/地图1）", ledger.conflictSummary())
+        confirm(9, Source.MAP, firstId = 20)
+        assertFalse(ledger.needsAudit)
+        assertEquals(9, ledger.stacks[mark])
+    }
+
+    /** 冲突提示要能看出是哪个系列、两边各是多少。 */
+    @Test fun `冲突明细写出记录值与地图值`() {
+        confirm(9, Source.CHOICE)
+        confirm(1, Source.MAP, firstId = 10)
+        assertTrue(ledger.conflictSummary().contains("记录9"))
+        assertTrue(ledger.conflictSummary().contains("地图1"))
+    }
+
+    /** 地图数字是全局总数，连续三帧一致就该纠正偏高的记录。 */
+    @Test fun `地图连续三帧一致时纠正记录`() {
+        ledger.acquired(mark, 9, 0)
+        assertEquals(9, ledger.stacks[mark])
+        repeat(3) { offset -> observe(4, Source.MAP, 10L + offset) }
+        assertEquals(4, ledger.stacks[mark])
+        assertFalse(ledger.needsAudit)
+    }
+
+    /** 两帧一致还不够——数字小、易误读，误覆盖的代价比多等一帧大。 */
+    @Test fun `地图两帧一致仍不足以覆盖记录`() {
+        ledger.acquired(mark, 9, 0)
+        repeat(2) { offset -> observe(4, Source.MAP, 10L + offset) }
+        assertEquals(9, ledger.stacks[mark])
+        assertTrue(ledger.needsAudit)
+    }
 }

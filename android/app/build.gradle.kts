@@ -13,6 +13,11 @@ val localBuildProperties = Properties().apply {
     rootProject.file("local.properties").takeIf { it.isFile }?.inputStream()?.use { load(it) }
 }
 val debugKeystorePath = localBuildProperties.getProperty("debug.keystore")
+// 只打需要的 ABI：onnxruntime 与 mlkit 的 .so 每个 ABI 约 30 MB，四份就是 110 MB+。
+// 默认 x86_64 对应 MuMu 模拟器（ro.product.cpu.abilist 首位）；真机在 local.properties 里写
+// abi.filters=arm64-v8a 即可，无需改这个文件。多个 ABI 用逗号分隔。
+val packagedAbiFilters = (localBuildProperties.getProperty("abi.filters") ?: "x86_64")
+    .split(',').map(String::trim).filter(String::isNotEmpty)
 
 android {
     namespace = "com.landosol.toolbox"
@@ -25,6 +30,10 @@ android {
         // major*10000 + minor*100 + patch, so the code stays monotonic as the name moves.
         versionCode = 10018
         versionName = "1.0.18"
+
+        ndk {
+            abiFilters += packagedAbiFilters
+        }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -92,6 +101,7 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.mlkit.text.recognition.chinese)
+    implementation(libs.onnxruntime.android)
     ksp(libs.androidx.room.compiler)
 
     implementation(platform(libs.androidx.compose.bom))

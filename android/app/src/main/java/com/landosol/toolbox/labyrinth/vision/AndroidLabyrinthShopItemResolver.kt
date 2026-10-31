@@ -9,11 +9,13 @@ internal fun resolveShopReceiptOrPage(
 ): LabyrinthEntryFrameResult = receipt ?: page()
 
 /** Every visible title is classified before a relic match can authorize a purchase. */
-class AndroidLabyrinthShopItemResolver(
+internal class AndroidLabyrinthShopItemResolver(
     submitTextRead: (Bitmap, (String?) -> Unit) -> Unit = AndroidChineseRoleNameOcr::readAsync,
     submitReceiptLines: (Bitmap, (List<LabyrinthShopOcrLine>?) -> Unit) -> Unit = AndroidChineseRoleNameOcr::readElementsAsync,
+    /** 回执字段的主读（PP-OCRv4）。 */
+    paddle: PaddleReceiptOcr? = null,
 ) {
-    private val receiptResolver = AndroidLabyrinthShopReceiptResolver(submit = submitReceiptLines)
+    private val receiptResolver = AndroidLabyrinthShopReceiptResolver(submit = submitReceiptLines, paddle = paddle)
     private val ocr = AndroidRelicRoiOcr(submitTextRead, maximumAttempts = 1)
     private val categories = LabyrinthShopCategoryResolution()
     private val accepted = mutableMapOf<String, Pair<Long, RelicOcrScheduler.Read>>()
@@ -37,10 +39,14 @@ class AndroidLabyrinthShopItemResolver(
             receiptResolver.clear()
             null
         }
-        return resolveShopReceiptOrPage(receipt?.let {
+        val resolved = resolveShopReceiptOrPage(receipt?.let {
             result.copy(observation = it.observation, shopObservation = it.shopObservation,
-                matchedFeatures = result.matchedFeatures + it.matchedFeatures)
+                matchedFeatures = result.matchedFeatures + it.matchedFeatures,
+                shopReceiptOcr = it.shopReceiptOcr)
         }) { resolveItems(bitmap, result) }
+        // 回执没认出来时同样要把六行读数带进调试状态。
+        return if (resolved.shopReceiptOcr != null) resolved
+            else resolved.copy(shopReceiptOcr = receiptResolver.diagnostics())
     }
 
     private fun resolveItems(bitmap: Bitmap, result: LabyrinthEntryFrameResult): LabyrinthEntryFrameResult {

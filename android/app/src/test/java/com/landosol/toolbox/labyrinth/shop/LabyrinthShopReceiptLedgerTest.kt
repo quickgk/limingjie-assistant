@@ -57,6 +57,21 @@ class LabyrinthShopReceiptLedgerTest {
         assertEquals(2, store.read(run).size)
     }
 
+    @Test fun `回执商品名的繁日字形与简体写法视为同一个字`() {
+        module.recordIntent(ShoppingTestData.item(name = "樱坚牢战衣", id = "relic-2"), 1000, 7, 1, 0, ShoppingTestData.encode)
+        module.confirmDispatched()
+        // 实机把「樱」读成「櫻」：同一个字的不同字形不能当成另一件商品。
+        assertNotNull(record(ShoppingTestData.receipt("櫻坚牢战衣")))
+        assertEquals(3, store.read(run).size)
+    }
+
+    @Test fun `回执商品名差一个字仍然拒绝`() {
+        module.recordIntent(ShoppingTestData.item(name = "樱坚牢战衣", id = "relic-2"), 1000, 7, 1, 0, ShoppingTestData.encode)
+        module.confirmDispatched()
+        ShoppingTestData.reject { record(ShoppingTestData.receipt("樱坚牢战裙")) }
+        assertEquals(2, store.read(run).size)
+    }
+
     @Test fun `同商品不同实际价格仍拒绝即使余额差额自洽`() {
         automated(); ShoppingTestData.reject { record(ShoppingTestData.receipt(spent = 200)) }
         assertEquals(2, store.read(run).size)
