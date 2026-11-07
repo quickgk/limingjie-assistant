@@ -56,6 +56,8 @@ object AccessibilityConnectionRegistry {
 }
 
 class LandosolAccessibilityService : AccessibilityService() {
+    private val gestureOwnership = GestureDispatchOwnership()
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         activeService = this
@@ -157,7 +159,9 @@ class LandosolAccessibilityService : AccessibilityService() {
     }
 
     private suspend fun performGlobalBack(): AutomationBackendResult = onMainThread {
-        if (performGlobalAction(GLOBAL_ACTION_BACK)) {
+        if (gestureOwnership.isActive()) {
+            AutomationBackendResult.Rejected("上一手势仍在结束，暂不接受新动作")
+        } else if (performGlobalAction(GLOBAL_ACTION_BACK)) {
             AutomationBackendResult.Completed
         } else {
             AutomationBackendResult.Rejected("系统拒绝返回操作")
@@ -174,81 +178,108 @@ class LandosolAccessibilityService : AccessibilityService() {
         description: String = "gesture",
         gestureId: Long = gestureSequence.incrementAndGet(),
         queuedAtMillis: Long = SystemClock.elapsedRealtime(),
-    ): AutomationBackendResult = withTimeoutOrNull(durationMillis + holdMillis + GESTURE_CALLBACK_GRACE_MILLIS) {
+    ): AutomationBackendResult = withTimeoutOrNull(
+        durationMillis + holdMillis + 2 * GESTURE_CALLBACK_GRACE_MILLIS + GESTURE_QUEUE_GRACE_MILLIS,
+    ) {
         suspendCancellableCoroutine { continuation ->
+            // Retained Android callbacks must not retain the caller's coroutine after it ends.
+            val pending = AtomicReference(continuation)
+            continuation.invokeOnCancellation { pending.set(null) }
             mainHandler.post {
-                if (!continuation.isActive) return@post
-                val dispatchedAt = SystemClock.elapsedRealtime()
-                Log.i(GESTURE_LOG_TAG, "gesture-dispatch id=$gestureId $description display=$displayId " +
-                    "explicitDisplay=${Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && displayId != Display.DEFAULT_DISPLAY} " +
-                    "queueMillis=${dispatchedAt - queuedAtMillis} durationMillis=$durationMillis holdMillis=$holdMillis " +
-                    "connected=${isConnected()} foreground=$foregroundPackageName activity=$foregroundActivityName")
-                // A drag that lifts at travel speed is read by the game as a fling and the
-                // map keeps sliding well past the gesture. Continue the same stroke with a
-                // 1 px, holdMillis-long tail so the velocity tracker samples ~0 before the
-                // pointer goes up, turning the same travel into a plain drag.
-                val mainStroke =
+                if (pending.get()?.isActive != true) return@post
+                val mainStroke = runCatching {
                     GestureDescription.StrokeDescription(path, 0, durationMillis, holdMillis > 0)
-                val builder = GestureDescription.Builder().addStroke(mainStroke)
-                if (holdMillis > 0) {
-                    val holdPath = Path().apply {
-                        moveTo(holdX, holdY)
-                        lineTo(holdX + 1f, holdY)
+                }.getOrElse {
+                    pending.getAndSet(null)?.let { if (it.isActive) it.resume(AutomationBackendResult.Rejected("无障碍手势参数无效")) }
+                    return@post
+                }
+                val token = Any()
+                if (!gestureOwnership.acquire(token)) {
+                    pending.getAndSet(null)?.let {
+                        if (it.isActive) it.resume(AutomationBackendResult.Rejected("上一手势仍在结束，暂不接受新动作"))
                     }
-                    builder.addStroke(
-                        mainStroke.continueStroke(holdPath, durationMillis, holdMillis, false),
-                    )
+                    return@post
                 }
-                // GestureDescription already targets the default display when no id is set.
-                // MuMu exposes the captured game through an additional cloned display and can
-                // acknowledge an explicitly-set display 0 gesture without delivering it to the
-                // real game window. Only opt into setDisplayId for a genuinely secondary target.
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && displayId != Display.DEFAULT_DISPLAY) {
-                    builder.setDisplayId(displayId)
-                }
-                val gesture = builder.build()
-                // Android 9's AccessibilityService never removes a callback from its internal
-                // mGestureStatusCallbackInfos after reporting the result, so every callback lives
-                // as long as the service. Capturing the continuation directly pinned the caller's
-                // whole coroutine chain, and through it each run's LabyrinthNodeSession with its
-                // 25.6 MB NodeTemplateSet — 1136 callbacks and 7 template sets in the 2026-09-24
-                // heap dump, OOM at run 4. The callback holds this clearable slot instead.
-                val pending = AtomicReference(continuation)
-                continuation.invokeOnCancellation { pending.set(null) }
-                val accepted = dispatchGesture(
-                    gesture,
-                    object : GestureResultCallback() {
-                        override fun onCompleted(gestureDescription: GestureDescription?) {
-                            Log.i(GESTURE_LOG_TAG, "手势完成 display=$displayId duration=${durationMillis}ms id=$gestureId callbackMillis=${SystemClock.elapsedRealtime() - dispatchedAt}")
-                            pending.getAndSet(null)?.let {
-                                if (it.isActive) it.resume(AutomationBackendResult.Completed)
-                            }
-                        }
+                val sequence = GestureReleaseSequence(hasHold = holdMillis > 0)
+                val operation = object {
+                    var watchdog: Runnable? = null
+                    val dispatchedAt = SystemClock.elapsedRealtime()
 
-                        override fun onCancelled(gestureDescription: GestureDescription?) {
-                            Log.w(GESTURE_LOG_TAG, "手势取消 display=$displayId duration=${durationMillis}ms id=$gestureId callbackMillis=${SystemClock.elapsedRealtime() - dispatchedAt}")
-                            pending.getAndSet(null)?.let {
-                                if (it.isActive) {
-                                    it.resume(
-                                        AutomationBackendResult.Rejected(
-                                            "显示器 $displayId 的无障碍手势被系统取消",
-                                        ),
-                                    )
-                                }
-                            }
+                    fun onEvent(
+                        phase: GestureReleaseSequence.Phase,
+                        event: GestureReleaseSequence.Event,
+                        reason: String,
+                    ) {
+                        if (!gestureOwnership.owns(token)) return
+                        val transition = sequence.advance(phase, event, reason)
+                        if (!transition.dispatchRelease && transition.result == null) return
+                        watchdog?.let(mainHandler::removeCallbacks)
+                        watchdog = null
+                        Log.i(GESTURE_LOG_TAG, "gesture-result id=$gestureId phase=$phase event=$event display=$displayId " +
+                            "callbackMillis=${SystemClock.elapsedRealtime() - dispatchedAt}")
+                        if (transition.dispatchRelease) {
+                            dispatch(GestureReleaseSequence.Phase.RELEASE)
+                        } else {
+                            gestureOwnership.release(token)
+                            pending.getAndSet(null)?.let { if (it.isActive) it.resume(checkNotNull(transition.result)) }
                         }
-                    },
-                    null,
-                )
-                if (!accepted && continuation.isActive) {
-                    pending.set(null)
-                    Log.w(GESTURE_LOG_TAG, "系统拒绝手势 display=$displayId duration=${durationMillis}ms id=$gestureId")
-                    continuation.resume(
-                        AutomationBackendResult.Rejected(
-                            "系统拒绝显示器 $displayId 的无障碍手势",
-                        ),
-                    )
+                    }
+
+                    fun dispatch(phase: GestureReleaseSequence.Phase) {
+                        if (!gestureOwnership.owns(token)) return
+                        try {
+                            dispatchOwned(phase)
+                        } catch (error: RuntimeException) {
+                            Log.w(GESTURE_LOG_TAG, "gesture-dispatch-failed id=$gestureId phase=$phase display=$displayId", error)
+                            onEvent(phase, GestureReleaseSequence.Event.REJECTED, "无障碍手势派发失败")
+                        }
+                    }
+
+                    fun dispatchOwned(phase: GestureReleaseSequence.Phase) {
+                        val stroke = if (phase == GestureReleaseSequence.Phase.TRAVEL) mainStroke else {
+                            // A continuation belongs to a NEW gesture; its clock starts at zero.
+                            // The tiny slow tail lowers lift-off velocity and explicitly lifts the contact.
+                            mainStroke.continueStroke(Path().apply {
+                                moveTo(holdX, holdY)
+                                lineTo(holdX + 1f, holdY)
+                            }, 0, holdMillis, false)
+                        }
+                        val builder = GestureDescription.Builder().addStroke(stroke)
+                        // Leave default display implicit; only target genuinely secondary displays explicitly.
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && displayId != Display.DEFAULT_DISPLAY) {
+                            builder.setDisplayId(displayId)
+                        }
+                        val phaseDuration = if (phase == GestureReleaseSequence.Phase.TRAVEL) durationMillis else holdMillis
+                        Log.i(GESTURE_LOG_TAG, "gesture-dispatch id=$gestureId phase=$phase $description display=$displayId " +
+                            "queueMillis=${SystemClock.elapsedRealtime() - queuedAtMillis} durationMillis=$phaseDuration " +
+                            "holdMillis=$holdMillis connected=${isConnected()} foreground=$foregroundPackageName activity=$foregroundActivityName")
+                        val accepted = this@LandosolAccessibilityService.dispatchGesture(
+                            builder.build(),
+                            object : GestureResultCallback() {
+                                override fun onCompleted(gestureDescription: GestureDescription?) {
+                                    onEvent(phase, GestureReleaseSequence.Event.COMPLETED, "")
+                                }
+
+                                override fun onCancelled(gestureDescription: GestureDescription?) {
+                                    onEvent(phase, GestureReleaseSequence.Event.CANCELLED,
+                                        "显示器 $displayId 的无障碍手势被系统取消")
+                                }
+                            },
+                            mainHandler,
+                        )
+                        if (!accepted) {
+                            onEvent(phase, GestureReleaseSequence.Event.REJECTED,
+                                "系统拒绝显示器 $displayId 的无障碍手势")
+                            return
+                        }
+                        watchdog = Runnable {
+                            onEvent(phase, GestureReleaseSequence.Event.TIMED_OUT,
+                                "显示器 $displayId 的无障碍手势回调超时")
+                        }.also { mainHandler.postDelayed(it, phaseDuration + GESTURE_CALLBACK_GRACE_MILLIS) }
+                    }
                 }
+                // Once injected, a held contact must finish its release even if the waiter cancels.
+                operation.dispatch(GestureReleaseSequence.Phase.TRAVEL)
             }
         }
     } ?: run {
@@ -268,6 +299,7 @@ class LandosolAccessibilityService : AccessibilityService() {
         private const val TAP_DURATION_MILLIS = 60L
         private const val MAX_GESTURE_DURATION_MILLIS = 5_000L
         private const val GESTURE_CALLBACK_GRACE_MILLIS = 2_000L
+        private const val GESTURE_QUEUE_GRACE_MILLIS = 1_000L
         private const val GESTURE_LOG_TAG = "LandosolGesture"
         private const val SWIPE_UP_DURATION_MILLIS = 400L
         private const val SWIPE_X = 540f
@@ -300,7 +332,9 @@ class LandosolAccessibilityService : AccessibilityService() {
 
         /** 通过无障碍全局动作派发（例如最近任务），返回是否被系统接受 */
         suspend fun dispatchGlobalAction(action: Int): Boolean = onMainThreadCompat {
-            current()?.performGlobalAction(action) == true
+            current()?.let { service ->
+                !service.gestureOwnership.isActive() && service.performGlobalAction(action)
+            } == true
         }
 
         /** 从屏幕上方往下滑（用于划掉最近任务卡片里的游戏卡片） */

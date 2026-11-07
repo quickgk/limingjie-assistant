@@ -6,7 +6,7 @@ import com.landosol.toolbox.labyrinth.vision.LabyrinthShopCategoryState
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemKind
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemMatch
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemStatus
-import com.landosol.toolbox.labyrinth.vision.LabyrinthShopReceiptRead
+
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -18,18 +18,18 @@ class LabyrinthShoppingPolicyIntegrationTest {
     private val budgetPolicy = LabyrinthShopPolicy(budgetOptimizationEnabled = true)
 
     @Test fun `默认关闭预算兼容既有未提供金额的购买调用`() {
-        val item = relic("legacy", 100).copy(priceRead = null)
-        val decision = LabyrinthShopPolicy().decide(5, listOf(item), emptyList(), refreshAvailable = true)
+        val item = relic("legacy", 100).copy(price = null)
+        val decision = LabyrinthShopPolicy().decideAfterFullScan(5, listOf(item), emptyList(), refreshAvailable = true)
         assertTrue(decision is LabyrinthShopDecision.BuyRelic)
         assertNull(decision.budget)
-        assertEquals(decision, LabyrinthShopPolicy(budgetOptimizationEnabled = false).decide(
+        assertEquals(decision, LabyrinthShopPolicy(budgetOptimizationEnabled = false).decideAfterFullScan(
             5, listOf(item), emptyList(), refreshAvailable = true,
-            verifiedBalance = -1, verifiedRefreshPrice = -1))
+            verifiedBalance = -1, refreshPrice = -1))
     }
 
     @Test fun `默认关闭预算保留选择印记未提供价格的既有兜底`() {
-        val item = role("legacy-choice", 100, choice = true).copy(priceRead = null)
-        val decision = LabyrinthShopPolicy().decide(3, listOf(item), emptyList(), refreshAvailable = false)
+        val item = role("legacy-choice", 100, choice = true).copy(price = null)
+        val decision = LabyrinthShopPolicy().decideAfterFullScan(3, listOf(item), emptyList(), refreshAvailable = false)
         assertTrue(decision is LabyrinthShopDecision.BuyRoleImprint)
         assertTrue((decision as LabyrinthShopDecision.BuyRoleImprint).opensRolePicker)
         assertNull(decision.budget)
@@ -41,13 +41,11 @@ class LabyrinthShoppingPolicyIntegrationTest {
         }
     }
 
-    @Test fun `可购买遗物随机与选择印记缺价格或未双读都等待`() {
+    @Test fun `可购买遗物随机与选择印记缺价格或负价都等待而零价不上架`() {
         for (item in listOf(relic("relic", 100), role("random", 100), role("choice", 100, choice = true))) {
-            assertTrue(decide(listOf(item.copy(priceRead = null))) is LabyrinthShopDecision.Wait)
-            assertTrue(decide(listOf(item.copy(priceRead = LabyrinthShopReceiptRead("100", 1, 1))))
-                is LabyrinthShopDecision.Wait)
-            assertTrue(decide(listOf(item.copy(priceRead = LabyrinthShopReceiptRead("-1", 1, 2))))
-                is LabyrinthShopDecision.Wait)
+            assertTrue(decide(listOf(item.copy(price = null))) is LabyrinthShopDecision.Wait)
+            assertTrue(decide(listOf(item.copy(price = -1))) is LabyrinthShopDecision.Wait)
+            assertTrue(decide(listOf(item.copy(price = 0)), refreshAvailable = false) is LabyrinthShopDecision.Close)
         }
     }
 
@@ -84,7 +82,7 @@ class LabyrinthShoppingPolicyIntegrationTest {
     @Test fun `实际刷新费预留生效且关闭刷新后释放购买额度`() {
         val items = listOf(relic("a", 400), relic("b", 400))
         val reserved = decide(items, balance = 1_000, refreshAvailable = true,
-            refreshPrice = 150) as LabyrinthShopDecision.BuyRelic
+            refreshPrice = 150, purchaseBudget = 400) as LabyrinthShopDecision.BuyRelic
         assertEquals(550L, reserved.budget!!.reserve)
         assertEquals(400L, reserved.budget!!.basketCost)
         val released = decide(items, balance = 1_000, refreshAvailable = true,
@@ -166,7 +164,7 @@ class LabyrinthShoppingPolicyIntegrationTest {
     }
 
     @Test fun `购买开关与区域四禁购优先于未知预算检查`() {
-        val unknown = relic("unknown-price", 100).copy(priceRead = null,
+        val unknown = relic("unknown-price", 100).copy(price = null,
             categoryState = LabyrinthShopCategoryState.READING)
         assertTrue(decide(listOf(unknown), balance = null, refreshAvailable = true,
             policy = LabyrinthShopPolicy(buyRelics = false, budgetOptimizationEnabled = true)) is LabyrinthShopDecision.Close)
@@ -208,10 +206,16 @@ class LabyrinthShoppingPolicyIntegrationTest {
             policy = policy) is LabyrinthShopDecision.Close)
     }
 
-    @Test fun `未配置刷新上限的区域不硬编码两次限制`() {
-        for (used in listOf(0, 1, 2, 5)) {
-            assertTrue(decide(disabledRow(), refreshAvailable = true, refreshPrice = 251,
-                refreshes = used) is LabyrinthShopDecision.Refresh)
+    @Test fun `未配置或较大的区域上限不能突破游戏两次刷新限制`() {
+        for (limits in listOf(emptyMap(), mapOf(5 to 99))) {
+            val policy = LabyrinthShopPolicy(refreshLimitsByArea = limits, budgetOptimizationEnabled = true)
+            for (used in listOf(0, 1, 2, 5)) {
+                val decision = decide(disabledRow(), balance = 10_000, refreshAvailable = true,
+                    refreshPrice = 300L * (1 + used), refreshes = used, policy = policy)
+                assertEquals("limits=$limits used=$used decision=$decision", used < 2,
+                    decision is LabyrinthShopDecision.Refresh)
+                if (used >= 2) assertTrue(decision is LabyrinthShopDecision.Close)
+            }
         }
         val policy = LabyrinthShopPolicy(refreshLimitsByArea = mapOf(5 to 0), budgetOptimizationEnabled = true)
         assertTrue(decide(disabledRow(), refreshAvailable = true, policy = policy) is LabyrinthShopDecision.Close)
@@ -225,13 +229,13 @@ class LabyrinthShoppingPolicyIntegrationTest {
         assertFalse(result.reason.contains("300"))
     }
 
-    @Test fun `刷新费用必须复核且余额恰好覆盖实际费用即可刷新`() {
+    @Test fun `刷新余额恰好覆盖费用时不能支付无购货能力刷新`() {
         for (price in listOf(null, -1L)) {
             assertTrue(decide(disabledRow(), refreshAvailable = true, refreshPrice = price)
                 is LabyrinthShopDecision.Wait)
         }
         assertTrue(decide(disabledRow(), balance = 73, refreshAvailable = true, refreshPrice = 73)
-            is LabyrinthShopDecision.Refresh)
+            is LabyrinthShopDecision.Close)
         assertTrue(decide(disabledRow(), balance = 72, refreshAvailable = true, refreshPrice = 73)
             is LabyrinthShopDecision.Close)
         assertTrue(decide(listOf(relic("a", 100)), refreshAvailable = true) is LabyrinthShopDecision.Wait)
@@ -241,7 +245,7 @@ class LabyrinthShoppingPolicyIntegrationTest {
         assertTrue(decide(disabledRow(), refreshAvailable = false, refreshKnown = false) is LabyrinthShopDecision.Wait)
         val disabled = LabyrinthShopPolicy(refreshEnabled = false, budgetOptimizationEnabled = true)
         assertTrue(decide(disabledRow(), refreshAvailable = true, refreshKnown = false,
-            balance = null, policy = disabled) is LabyrinthShopDecision.Close)
+            balance = null, policy = disabled) is LabyrinthShopDecision.Wait)
         assertTrue(decide(listOf(relic("a", 100)), refreshAvailable = true, refreshKnown = false,
             policy = disabled) is LabyrinthShopDecision.BuyRelic)
         val capped = LabyrinthShopPolicy(finalArea = 3, budgetOptimizationEnabled = true)
@@ -253,14 +257,14 @@ class LabyrinthShoppingPolicyIntegrationTest {
         assertTrue(decide(listOf(relic("a", 100)), area = 3, refreshAvailable = true)
             is LabyrinthShopDecision.BuyRelic)
         assertTrue(decide(disabledRow(), area = 3, refreshAvailable = true, balance = null)
-            is LabyrinthShopDecision.Close)
+            is LabyrinthShopDecision.Wait)
         assertTrue(decide(disabledRow(), area = null, refreshAvailable = true, balance = null)
-            is LabyrinthShopDecision.Close)
+            is LabyrinthShopDecision.Wait)
     }
 
     @Test fun `缺商品行或仍有可买遗物时不提前刷新`() {
-        assertTrue(decide(disabledRow().take(2), refreshAvailable = true, refreshPrice = 73)
-            is LabyrinthShopDecision.Close)
+        assertTrue(budgetPolicy.decide(5, disabledRow().take(2), emptyList(), refreshAvailable = true,
+            verifiedBalance = 1000, refreshPrice = 73) is LabyrinthShopDecision.Wait)
         assertTrue(decide(listOf(relic("a", 100)), balance = 1_000,
             refreshAvailable = true, refreshPrice = 73) is LabyrinthShopDecision.BuyRelic)
     }
@@ -282,13 +286,13 @@ class LabyrinthShoppingPolicyIntegrationTest {
             is LabyrinthShopDecision.Wait)
     }
 
-    @Test fun `身份识别已耗尽的未知商品仍跳过且不伪造售罄证据`() {
+    @Test fun `身份识别已耗尽的未知商品保留异常而不伪造购物完成`() {
         val exhausted = item("exhausted", 100, LabyrinthShopItemKind.UNKNOWN)
-            .copy(categoryState = LabyrinthShopCategoryState.EXHAUSTED, priceRead = null)
-        assertTrue(decide(listOf(exhausted, relic("known", 100))) is LabyrinthShopDecision.BuyRelic)
+            .copy(categoryState = LabyrinthShopCategoryState.EXHAUSTED, price = null)
+        assertTrue(decide(listOf(exhausted, relic("known", 100))) is LabyrinthShopDecision.Wait)
         assertTrue(decide(disabledRow().take(2) + exhausted,
-            refreshAvailable = true, refreshPrice = 73) is LabyrinthShopDecision.Close)
-        assertTrue(decide(listOf(exhausted), balance = null) is LabyrinthShopDecision.Close)
+            refreshAvailable = true, refreshPrice = 73) is LabyrinthShopDecision.Wait)
+        assertTrue(decide(listOf(exhausted), balance = null) is LabyrinthShopDecision.Wait)
         assertTrue(decide(listOf(exhausted.copy(categoryState = LabyrinthShopCategoryState.READING)))
             is LabyrinthShopDecision.Wait)
     }
@@ -298,11 +302,11 @@ class LabyrinthShoppingPolicyIntegrationTest {
         assertTrue(decide(listOf(incomplete)) is LabyrinthShopDecision.Wait)
     }
 
-    @Test fun `策略接受十二候选并把十三候选转为安全等待`() {
+    @Test fun `策略只接受完整六格并拒绝七格或更多候选`() {
         val items = (1..13).map { relic("item$it", 100) }
-        val result = decide(items.take(12), balance = 1_200) as LabyrinthShopDecision.BuyRelic
-        assertEquals(12, result.budget!!.selectedSlots.size)
-        assertTrue(decide(items, balance = 1_300) is LabyrinthShopDecision.Wait)
+        val result = decide(items.take(6), balance = 600) as LabyrinthShopDecision.BuyRelic
+        assertEquals(6, result.budget!!.selectedSlots.size)
+        assertTrue(decide(items.take(7), balance = 1_300) is LabyrinthShopDecision.Wait)
         assertTrue(decide(items, balance = 0) is LabyrinthShopDecision.Wait)
     }
 
@@ -325,25 +329,37 @@ class LabyrinthShoppingPolicyIntegrationTest {
         assertEquals(90L, next.budget!!.basketCost)
     }
 
+    @Test fun `刷新300和600限两次且保留区域3和区域4更严限制`() {
+        assertTrue(decide(disabledRow(), refreshAvailable = true, refreshPrice = 300, refreshes = 0) is LabyrinthShopDecision.Refresh)
+        assertTrue(decide(disabledRow(), refreshAvailable = true, refreshPrice = 600, refreshes = 1) is LabyrinthShopDecision.Refresh)
+        assertTrue(decide(disabledRow(), refreshAvailable = true, refreshPrice = 900, refreshes = 2) is LabyrinthShopDecision.Close)
+        val earlier = LabyrinthShopPolicy(finalArea = 3, budgetOptimizationEnabled = true)
+        assertTrue(decide(disabledRow(), area = 3, refreshAvailable = true, refreshPrice = 300, policy = earlier) is LabyrinthShopDecision.Refresh)
+        assertTrue(decide(disabledRow(), area = 3, refreshAvailable = true, refreshPrice = 600, refreshes = 1, policy = earlier) is LabyrinthShopDecision.Close)
+        assertTrue(decide(disabledRow(), area = 4, refreshAvailable = true, refreshPrice = 300, policy = earlier) is LabyrinthShopDecision.Close)
+    }
+
     private fun decide(
         items: List<LabyrinthShopItemMatch>, balance: Long? = 1_000, area: Int? = 5,
         refreshAvailable: Boolean = false, refreshPrice: Long? = null, refreshKnown: Boolean = true,
         refreshes: Int = 0, purchases: Int = 0, policy: LabyrinthShopPolicy = budgetPolicy,
-    ) = policy.decide(
+        purchaseBudget: Long? = 100,
+    ) = policy.decideAfterFullScan(
         area, items, emptyList(), refreshAvailable = refreshAvailable,
         refreshAvailabilityKnown = refreshKnown, refreshesUsedInVisit = refreshes,
-        relicPurchasesInCycle = purchases, verifiedBalance = balance, verifiedRefreshPrice = refreshPrice,
+        relicPurchasesInCycle = purchases, verifiedBalance = balance, refreshPrice = refreshPrice,
+        refreshPurchaseBudget = purchaseBudget, successfulRefreshesInVisit = refreshes,
     )
 
     private fun disabledRow() = (1..3).map {
         item("disabled$it", 100, LabyrinthShopItemKind.UNKNOWN)
-            .copy(status = LabyrinthShopItemStatus.DISABLED, priceRead = null)
+            .copy(status = LabyrinthShopItemStatus.DISABLED, price = null)
     }
 
     private fun relic(id: String, price: Long, mark: LabyrinthRelicMark = LabyrinthRelicMark.CRITICAL) =
         item(id, price, LabyrinthShopItemKind.RELIC).copy(relicMatch = LabyrinthRelicMatch(
             slotId = id, relicId = id, displayName = id, attribute = mark.label, attributeBonus = "1",
-            effect = null, confidence = 0.9, screenRect = rect, iconRect = rect, rivalMargin = 0.2,
+            effect = null, confidence = 0.9, screenRect = rect, iconRect = rect, rivalMargin = 0.2, rarity = 1,
         ))
 
     private fun role(id: String, price: Long, choice: Boolean = false) =
@@ -355,6 +371,6 @@ class LabyrinthShoppingPolicyIntegrationTest {
     private fun item(id: String, price: Long, kind: LabyrinthShopItemKind) = LabyrinthShopItemMatch(
         slotId = id, screenRect = rect, buyButtonRect = rect, buyButtonScore = 0.9,
         buyButtonEnabledEvidence = 1.0, status = LabyrinthShopItemStatus.AVAILABLE, kind = kind,
-        priceRead = LabyrinthShopReceiptRead(price.toString(), 1L, 2),
+        price = price,
     )
 }

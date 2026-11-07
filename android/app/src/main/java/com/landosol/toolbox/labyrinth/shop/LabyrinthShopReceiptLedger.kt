@@ -3,13 +3,12 @@ package com.landosol.toolbox.labyrinth.shop
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopReceiptRead
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemText
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopPurchaseReceiptObservation
-import java.io.FileOutputStream
 import kotlinx.serialization.json.*
 
-/** 金额及原图先入账，持有提交是之后独立的耐久事实。 */
+/** 精确回执事实先入账，持有提交是之后独立的耐久事实。 */
 class LabyrinthShopReceiptLedger(private val store: LabyrinthShoppingJournal) {
     fun record(run: LabyrinthShoppingJournal.Run, receipt: LabyrinthShopPurchaseReceiptObservation,
-        nodeId: Long?, floor: Int?, now: Long, encode: (FileOutputStream) -> Boolean): ReceiptCommit = synchronized(store.lock) {
+        nodeId: Long?, floor: Int?, now: Long): ReceiptCommit = synchronized(store.lock) {
         check(receipt.verified) { "购买回执尚未通过独立双读与金额校验" }
         val events = store.read(run)
         val key = "purchase-" + LabyrinthShoppingJournal.key("${run.runId}|$nodeId|${fingerprint(receipt)}")
@@ -21,7 +20,7 @@ class LabyrinthShopReceiptLedger(private val store: LabyrinthShoppingJournal) {
         }
         val intent = pendingIntent(events)
         if (intent != null) {
-            check(store.evidenceValid(run, intent)) { "购买意图原图缺失或校验失败" }
+            validateIntent(run, intent)
             check(intent["node_id"] == JsonPrimitive(nodeId) && intent["floor"] == JsonPrimitive(floor)) {
                 "回执与待确认意图不在同一节点或楼层，必须先取消意图"
             }
@@ -29,7 +28,6 @@ class LabyrinthShopReceiptLedger(private val store: LabyrinthShoppingJournal) {
         }
         val confirmation = intent?.let { confirmation(run, it, events) }
         val action = confirmation?.dispatched ?: confirmation?.prepared
-        val evidence = store.evidence(run, key, encode)
         val event = store.append(run, key, "shop.purchase_completed", nodeId, floor, now, buildJsonObject {
             put("receipt_id", key); put("receipt_fingerprint", fingerprint(receipt))
             put("intent_id", intent?.get("event_id") ?: JsonNull)
@@ -40,7 +38,7 @@ class LabyrinthShopReceiptLedger(private val store: LabyrinthShoppingJournal) {
             put("association_status", if (intent == null) "observed_without_intent" else "intent_matched")
             put("automated", action != null); put("confirmation_id", action?.get("event_id") ?: JsonNull)
             put("ocr", receiptEvidence(receipt))
-        }, evidence)
+        })
         commit(run, event, events + event)
     }
 
@@ -48,84 +46,117 @@ class LabyrinthShopReceiptLedger(private val store: LabyrinthShoppingJournal) {
         val events = store.read(run)
         val receipt = events.singleOrNull { id(it) == key && type(it) == "shop.purchase_completed" }
         check(receipt != null) { "持有提交必须在购买回执入账之后" }
+        check(!purchaseAbandoned(events, payload(receipt)["intent_id"])) { "已放弃购买不能补写持有提交" }
         val saved = commit(run, receipt, events)
         if (saved.ownershipCommitted) return@synchronized
         store.append(run, "ownership-$key", "shop.ownership_committed",
             receipt["node_id"]?.jsonPrimitive?.longOrNull, receipt["floor"]?.jsonPrimitive?.intOrNull, now,
             buildJsonObject { put("receipt_id", key); put("item_id", JsonPrimitive(saved.itemId)) },
-            receipt["evidence_ref"]?.jsonPrimitive?.contentOrNull,
             source = "ownership_commit")
     }
 
-    fun canDismiss(run: LabyrinthShoppingJournal.Run, receipt: LabyrinthShopPurchaseReceiptObservation): Boolean = synchronized(store.lock) {
-        if (!receipt.verified) return@synchronized false
-        val events = store.read(run)
-        val event = events.singleOrNull { type(it) == "shop.purchase_completed" &&
-            payload(it)["receipt_fingerprint"]?.jsonPrimitive?.content == fingerprint(receipt) }
-            ?: return@synchronized false
-        // 原图不通过时只允许保留弹窗；不能由重识别或新图修补旧事实。
-        runCatching { commit(run, event, events).let { it.automated && it.ownershipCommitted } }.getOrDefault(false)
+    fun canDismiss(run: LabyrinthShoppingJournal.Run, receipt: LabyrinthShopPurchaseReceiptObservation,
+        nodeId: Long?, floor: Int?, expectedReceiptId: String? = null): Boolean = synchronized(store.lock) {
+        if (!receipt.verified || nodeId == null || floor == null) return@synchronized false
+        runCatching {
+            val events = store.read(run)
+            val key = "purchase-" + LabyrinthShoppingJournal.key("${run.runId}|$nodeId|${fingerprint(receipt)}")
+            if (expectedReceiptId != null && expectedReceiptId != key) return@runCatching false
+            val event = events.singleOrNull { type(it) == "shop.purchase_completed" && id(it) == key &&
+                it["node_id"] == JsonPrimitive(nodeId) && it["floor"] == JsonPrimitive(floor) &&
+                payload(it)["receipt_fingerprint"] == JsonPrimitive(fingerprint(receipt)) } ?: return@runCatching false
+            if (purchaseAbandoned(events, payload(event)["intent_id"])) return@runCatching false
+            commit(run, event, events).let { it.automated && it.ownershipCommitted }
+        }.getOrDefault(false)
     }
 
     internal fun commit(run: LabyrinthShoppingJournal.Run, event: JsonObject, events: List<JsonObject>): ReceiptCommit {
-        check(store.evidenceValid(run, event)) { "已记录购买回执的原图缺失或校验失败" }
+        checkScope(run, event)
         val context = payload(event)
         validateReceipt(event)
-        val automated = context["automated"]?.jsonPrimitive?.booleanOrNull == true
+        val automated = checkNotNull(context["automated"]?.jsonPrimitive?.booleanOrNull) { "回执缺少自动归属状态" }
         val intentId = context["intent_id"]?.jsonPrimitive?.contentOrNull
         val intent = intentId?.let { key -> events.singleOrNull { type(it) == "shop.purchase_intent" && id(it) == key } }
         val receiptSeq = event["seq"]!!.jsonPrimitive.int
+        check(context["association_status"] == JsonPrimitive(if (intentId == null) "observed_without_intent" else "intent_matched")) {
+            "回执归属状态与意图关联不符"
+        }
         if (intentId != null) {
-            check(intent != null && store.evidenceValid(run, intent)) { "关联购买意图的原图无效" }
+            checkNotNull(intent) { "缺少关联购买意图" }
+            validateIntent(run, intent)
+            val original = payload(intent)
             check(intent["seq"]!!.jsonPrimitive.int < receiptSeq &&
                 intent["node_id"] == event["node_id"] && intent["floor"] == event["floor"] &&
-                context["item_id"] == payload(intent)["item_id"] && matches(intent,
+                context["item_kind"] == original["item_kind"] && context["item_id"] == original["item_id"] &&
+                LabyrinthShopItemName.equal(original["item_name"]?.jsonPrimitive?.contentOrNull,
+                    context["item_name"]?.jsonPrimitive?.contentOrNull) && matches(intent,
                     context["item_name"]?.jsonPrimitive?.contentOrNull,
                     context["spent"]?.jsonPrimitive?.longOrNull, context["balance_before"]?.jsonPrimitive?.longOrNull) &&
-                events.none { type(it) == "shop.purchase_intent_cancelled" && payload(it)["intent_id"] == context["intent_id"] &&
-                    it["seq"]!!.jsonPrimitive.int < receiptSeq }) { "回执关联意图已取消、内容不符或次序无效" }
+                events.none { type(it) in setOf("shop.purchase_intent_cancelled", "shop.purchase_abandoned") &&
+                    payload(it)["intent_id"] == context["intent_id"] && it["seq"]!!.jsonPrimitive.int < receiptSeq }) {
+                "回执关联意图已取消或放弃、内容不符或次序无效"
+            }
         }
         if (automated) {
             check(intent != null) { "自动购买缺少精确意图" }
             // 即使没有 dispatch 回调，未撤回的耐久 prepared 与精确回执也证明实际完成。
             val state = confirmation(run, intent, events)
             val action = state.dispatched ?: state.prepared
-            check(action != null && action["seq"]!!.jsonPrimitive.int < receiptSeq) {
-                "自动购买缺少回执之前未撤回的确认耐久证据"
-            }
-            context["confirmation_id"]?.let { check(it == action["event_id"]) { "回执确认编号不一致" } }
-        }
-        val ownerships = events.filter { type(it) == "shop.ownership_committed" &&
-            payload(it)["receipt_id"] == event["event_id"] }
+            check(action != null && action["seq"]!!.jsonPrimitive.int < receiptSeq &&
+                context["confirmation_id"] == action["event_id"]) { "回执缺少此前精确且未撤回的确认" }
+        } else check(context["confirmation_id"] == JsonNull) { "人工回执不能携带自动确认许可" }
+        val ownerships = events.filter { type(it) == "shop.ownership_committed" && payload(it)["receipt_id"] == event["event_id"] }
         check(ownerships.size <= 1) { "同一回执存在多个持有提交事件" }
         val ownership = ownerships.singleOrNull()
-        if (ownership != null) check(ownership["seq"]!!.jsonPrimitive.int > receiptSeq &&
-            ownership["node_id"] == event["node_id"] && ownership["floor"] == event["floor"] &&
-            payload(ownership)["item_id"] == context["item_id"] &&
-            ownership["evidence_ref"] == event["evidence_ref"] && store.evidenceValid(run, ownership)) {
-            "持有提交次序、身份或证据无效"
+        if (ownership != null) {
+            checkScope(run, ownership)
+            check(ownership["seq"]!!.jsonPrimitive.int > receiptSeq &&
+                ownership["node_id"] == event["node_id"] && ownership["floor"] == event["floor"] &&
+                payload(ownership)["item_id"] == context["item_id"] &&
+                ownership["source"] == JsonPrimitive("ownership_commit") &&
+                ownership["verification_status"] == JsonPrimitive("verified")) { "持有提交次序、身份或来源无效" }
         }
         return ReceiptCommit(id(event), context["item_id"]?.jsonPrimitive?.contentOrNull, automated, ownership != null)
+    }
+
+    private fun checkScope(run: LabyrinthShoppingJournal.Run, event: JsonObject) {
+        check(event["run_id"] == JsonPrimitive(run.runId) && event["enter_id"] == JsonPrimitive(run.enterId)) { "购物事实不属于当前运行" }
+    }
+
+    internal fun validateIntent(run: LabyrinthShoppingJournal.Run, intent: JsonObject) {
+        checkScope(run, intent)
+        val context = payload(intent)
+        val name = context["item_name"]?.jsonPrimitive?.contentOrNull
+        val price = context["expected_spent"]?.jsonPrimitive?.longOrNull
+        val balance = context["expected_balance_before"]?.jsonPrimitive?.longOrNull
+        val choice = context["choice_imprint"]?.jsonPrimitive?.booleanOrNull
+        check(type(intent) == "shop.purchase_intent" && intent["source"] == JsonPrimitive("automation_intent") &&
+            intent["verification_status"] == JsonPrimitive("intent_only") && !name.isNullOrBlank() &&
+            price != null && price > 0 && balance != null && balance >= price && choice != null) { "购买意图身份、金额或来源无效" }
+        if (context["item_kind"] == JsonPrimitive("role_imprint")) {
+            val label = LabyrinthShopItemText.roleImprintLabel(name)
+            check(label != null && context["item_id"] == JsonNull && context["role_label"] == JsonPrimitive(label) &&
+                LabyrinthShopItemText.isChoiceRoleImprint(name) == choice) { "印记意图职能、选择类型或持有身份不符" }
+        } else check(context["item_kind"] == JsonPrimitive("relic") &&
+            !context["item_id"]?.jsonPrimitive?.contentOrNull.isNullOrBlank() && context["role_label"] == JsonNull &&
+            !choice && !LabyrinthShopItemText.looksLikeRoleImprint(name)) { "遗物意图分类或身份不符" }
     }
 
     internal data class Confirmation(val prepared: JsonObject?, val dispatched: JsonObject?)
 
     internal fun confirmation(run: LabyrinthShoppingJournal.Run, intent: JsonObject,
         events: List<JsonObject>): Confirmation {
-        check(store.evidenceValid(run, intent) &&
-            intent["verification_status"]?.jsonPrimitive?.contentOrNull == "intent_only" &&
-            intent["source"]?.jsonPrimitive?.contentOrNull == "automation_intent") { "购买意图耐久证据无效" }
+        validateIntent(run, intent)
         var prepared: JsonObject? = null
         var dispatched: JsonObject? = null
         events.filter { type(it) in CONFIRMATION_TYPES && payload(it)["intent_id"] == intent["event_id"] }.forEach { event ->
             val seq = event["seq"]!!.jsonPrimitive.int
             check(seq > intent["seq"]!!.jsonPrimitive.int && event["node_id"] == intent["node_id"] &&
-                event["floor"] == intent["floor"] && event["evidence_ref"] == intent["evidence_ref"] &&
-                event["evidence_sha256"] == intent["evidence_sha256"] && store.evidenceValid(run, event) &&
+                event["floor"] == intent["floor"] && event["run_id"] == intent["run_id"] && event["enter_id"] == intent["enter_id"] &&
                 event["source"]?.jsonPrimitive?.contentOrNull == "automation_action" && events.none {
-                    type(it) in setOf("shop.purchase_intent_cancelled", "shop.purchase_completed") &&
+                    type(it) in setOf("shop.purchase_intent_cancelled", "shop.purchase_abandoned", "shop.purchase_completed") &&
                         payload(it)["intent_id"] == intent["event_id"] && it["seq"]!!.jsonPrimitive.int < seq
-                }) { "确认事件的意图、节点、原图或耐久次序无效" }
+                }) { "确认事件的意图、作用域、来源或耐久次序无效" }
             when (type(event)) {
                 "shop.purchase_confirm_prepared" -> {
                     check(prepared == null && dispatched == null &&
@@ -168,7 +199,7 @@ class LabyrinthShopReceiptLedger(private val store: LabyrinthShoppingJournal) {
                 saved["evidence_id"]?.jsonPrimitive?.longOrNull ?: return null,
                 saved["confirmations"]?.jsonPrimitive?.intOrNull ?: return null)
         }
-        // 恢复只核对已保存的独立读数与原图；确认按钮的文字不作为交易证据，不参与恢复校验。
+        // 恢复核对已保存的独立读数、身份与金额算术。
         val receipt = LabyrinthShopPurchaseReceiptObservation(read("heading"), read("item"), read("expenditure"),
             read("before"), read("after"), read("button"))
         val spent = receipt.spent
@@ -196,9 +227,14 @@ class LabyrinthShopReceiptLedger(private val store: LabyrinthShoppingJournal) {
         internal fun type(event: JsonObject): String? = event["type"]?.jsonPrimitive?.contentOrNull
         internal fun payload(event: JsonObject): JsonObject = event["payload"]!!.jsonObject
 
+        internal fun purchaseAbandoned(events: List<JsonObject>, intentId: JsonElement?): Boolean =
+            intentId != null && intentId != JsonNull && events.any {
+                type(it) == "shop.purchase_abandoned" && payload(it)["intent_id"] == intentId
+            }
+
         internal fun pendingIntent(events: List<JsonObject>): JsonObject? {
             val pending = events.filter { candidate -> type(candidate) == "shop.purchase_intent" && events.none {
-                type(it) in setOf("shop.purchase_intent_cancelled", "shop.purchase_completed") &&
+                type(it) in setOf("shop.purchase_intent_cancelled", "shop.purchase_abandoned", "shop.purchase_completed") &&
                     payload(it)["intent_id"] == candidate["event_id"]
             } }
             check(pending.size <= 1) { "存在多个未结束购买意图，拒绝猜测自动关联" }

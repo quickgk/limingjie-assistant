@@ -83,12 +83,12 @@ data class LabyrinthShopPurchaseReceiptObservation(
         ?.takeIf { it.length in 2..80 }
     val spent: Long? get() = expenditure?.text?.filterNot(Char::isWhitespace)?.let {
         // 金→全仅限完整花费句；金额本身不做字符猜测，且必须与余额差额一致。
-        Regex("^消耗阿[尔爾]法[金全]币[×xX*](\\d{1,3}(?:[,，.·]\\d{3})+|\\d+)$")
+        Regex("^消耗阿[尔爾]法[金全]币[×xX*]([0-9]{1,3}(?:[,，.·][0-9]{3})+|[0-9]+)$")
             .matchEntire(it)?.groupValues?.get(1)?.let(::parseAmount)
     }
     val before: Long? get() = balanceBefore?.text?.let(::parseAmount)
     val after: Long? get() = balanceAfter?.text?.let(::parseAmount)
-    /** 参与复核的只有标题与四项交易事实；确认按钮由弹窗标题和确认矩形几何证明，不靠 OCR 认字。 */
+    /** 参与复核的只有标题与四项交易事实；确认按钮由弹窗标题和确认矩形几何证明。 */
     val independentReadsConfirmed: Boolean get() =
         listOf(heading, item, expenditure, balanceBefore, balanceAfter)
             .all { it != null && it.confirmations >= 2 }
@@ -117,9 +117,13 @@ data class LabyrinthShopPurchaseReceiptObservation(
     }
 }
 
+/** 区分普通钱包与当前确认画面的读数，禁止将前一页缓存作为确认输入。 */
+enum class LabyrinthCurrencySource { WALLET, PURCHASE_CONFIRMATION, REFRESH_CONFIRMATION }
+
 /** 钱包的纯模型；Android依赖仅存在于适配器中。 */
 data class LabyrinthCurrencyObservation(
     val read: LabyrinthShopReceiptRead? = null,
+    val source: LabyrinthCurrencySource = LabyrinthCurrencySource.WALLET,
 ) {
     val balance: Long? get() = read?.takeIf { it.confirmations >= 2 }?.text
         ?.let(LabyrinthShopPurchaseReceiptObservation::parseAmount)

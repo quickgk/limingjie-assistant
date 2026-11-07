@@ -29,6 +29,9 @@ internal class LabyrinthShopOcrEpoch {
         return Ticket(epoch, current, ++sequence).also { pending = it }
     }
 
+    fun isCurrent(ticket: Ticket): Boolean = pending == ticket && ticket.epoch == epoch &&
+        ticket.fingerprint == fingerprint
+
     fun complete(ticket: Ticket): Boolean {
         if (pending != ticket) return false
         pending = null

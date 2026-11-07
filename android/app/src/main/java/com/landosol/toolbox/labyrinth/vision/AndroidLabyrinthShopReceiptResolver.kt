@@ -43,9 +43,9 @@ internal fun LabyrinthShopReceiptReadState.frameResult(frameWidth: Int, frameHei
 /**
  * 回执识别器。
  *
- * 主读是 PP-OCRv4：六块字段按参考矩形各自裁出、逐块识别，读数直接进判定。未配置 Paddle 引擎
- * 时退回拼图路径：六块裁图放大后排进一张白底拼图、整图只 OCR 一次，白字蓝底的标题与确认按钮
- * 先做白字黑底二值化。两次读数的复核交给 [LabyrinthShopReceiptReadState] 按解析事实比较。
+ * 主读是 PP-OCRv4：标题与四个交易字段按固定位置分别裁出、逐块识别；确认按钮文字不读取。
+ * 标题不是购买完成时只复探标题。未配置 Paddle 时使用五字段拼图，标题做白字黑底二值化。
+ * 六行诊断的按钮位置保留为空；两次读数由 [LabyrinthShopReceiptReadState] 按解析事实比较。
  */
 internal class AndroidLabyrinthShopReceiptResolver(
     clock: () -> Long = SystemClock::elapsedRealtime,
@@ -54,62 +54,91 @@ internal class AndroidLabyrinthShopReceiptResolver(
      * PP-OCRv4 主读引擎；null 表示不运行，此时退回拼图 + ML Kit，判定链保持可用但没有影子读数。
      */
     private val paddle: PaddleReceiptOcr? = null,
+    private val runtime: AndroidShopOcrRuntime = AndroidShopOcrRuntime(paddle, AndroidChineseRoleNameOcr::readAsync),
 ) {
     private val lock = Any()
     private val state = LabyrinthShopReceiptReadState(clock)
-    private val paddleExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "paddle-receipt-ocr").apply { isDaemon = true }
+    private val consumption = ShopOcrConsumption(runtime.performance)
+    private val owner = "shop-receipt"
+    private var scope = ""
+    private var lastRequestedCapture = Long.MIN_VALUE
+
+    fun bindScope(value: String) = synchronized(lock) {
+        if (scope != value) { scope = value; clear() }
     }
     /** 影子读数每个回执画面只跑一次。 */
     private var mlkitFingerprint: Long? = null
 
     fun clear() = synchronized(lock) {
         state.clear()
+        consumption.clear()
+        lastRequestedCapture = Long.MIN_VALUE
+        runtime.coordinator.cancel(owner)
         mlkitFingerprint = null
     }
 
     /** 最近一次回执读数与判定；回执没读成时也带着它，供调试状态记录现场。 */
     fun diagnostics(): LabyrinthShopReceiptOcrDiagnostics? = synchronized(lock) { state.diagnostics() }
 
-    fun resolve(bitmap: Bitmap): LabyrinthEntryFrameResult? {
+    fun resolve(bitmap: Bitmap, frame: AndroidFrameRoiFingerprints): LabyrinthEntryFrameResult? {
         val confirmRect = ReferenceFitMapper.map(bitmap.width, bitmap.height, REFERENCE, LABYRINTH_SHOP_RECEIPT_CONFIRM_RECT)
+        if (!frame.isCurrent()) return null
+        val headingRect = ReferenceFitMapper.map(bitmap.width, bitmap.height, REFERENCE,
+            LABYRINTH_SHOP_RECEIPT_COLLAGE_FIELDS[0]) ?: return null
+        val headingFingerprint = frame.fingerprint(bitmap, headingRect)
         val fingerprint = receiptFingerprint(bitmap)
         synchronized(lock) {
             // PP-OCRv4 是主读：它同时承担判定与诊断里的 paddle 字段。引擎不可用时退回 ML Kit，
             // 判定链保持可用，只是没有影子读数。
             state.setPrimaryEngine(paddle?.modelName ?: MLKIT_SHADOW_MODEL)
-            state.request(fingerprint)?.let { request ->
-                val engine = paddle
-                if (engine != null) submitPaddle(bitmap, request, confirmRect, engine)
-                else submitMlKit(bitmap, request, confirmRect)
+            // Observe content on every frame, but never start a second look from the same capture.
+            val request = state.requestContent(headingFingerprint, fingerprint)
+            if (request != null) {
+                if (frame.captureSequence <= lastRequestedCapture) state.cancel(request)
+                else {
+                    lastRequestedCapture = frame.captureSequence
+                    val engine = paddle
+                    if (engine != null) submitPaddle(bitmap, request, confirmRect, frame.captureSequence, frame.isCurrent)
+                    else submitMlKit(bitmap, request, confirmRect)
+                }
             }
+            state.receipt?.heading?.evidenceId?.let { consumption.consume(it, frame.captureSequence) }
             scheduleMlKitShadow(bitmap, fingerprint)
             return state.frameResult(bitmap.width, bitmap.height)
         }
     }
 
-    /** 主读：PP-OCRv4 逐块识别六行，结果直接进判定。 */
+    /** Title first, then four transaction fields on the same copied capture. */
     private fun submitPaddle(
         bitmap: Bitmap,
         request: LabyrinthShopReceiptReadState.Request,
         confirmRect: EntryPixelRect?,
-        engine: PaddleReceiptOcr,
+        captureSequence: Long,
+        sourceCurrent: () -> Boolean,
     ) {
-        state.markPaddleRunning(engine.modelName)
-        val crops = cropFields(bitmap)
-        paddleExecutor.execute {
-            val texts = crops.map { crop ->
-                try {
-                    engine.recognize(crop)
-                } catch (_: Exception) {
-                    null
-                } finally {
-                    if (!crop.isRecycled) crop.recycle()
-                }
-            }
+        val token = ShopOcrToken(owner, request.ticket.epoch, scope, "receipt", captureSequence,
+            request.ticket.fingerprint, "receipt-fields", 1, request.ticket.evidenceId)
+        state.markPaddleRunning(paddle?.modelName)
+        val crops = try { cropFields(bitmap) } catch (_: Exception) {
+            state.cancel(request)
+            return
+        }
+        runtime.coordinator.submit(token, crops, priority = 2,
+            valid = { sourceCurrent() && synchronized(lock) { state.isCurrent(request) } },
+            recognize = { inputs, current -> recognizeShopReceiptFields(inputs, current, runtime::recognizeReceipt) },
+        ) { outcome ->
             synchronized(lock) {
-                state.setPaddle(texts)
-                state.completeRows(request, texts, confirmRect)
+                when (val currentOutcome = if (sourceCurrent()) outcome else ShopOcrOutcome.Cancelled) {
+                    is ShopOcrOutcome.Completed -> {
+                        val rows = currentOutcome.value
+                        if (state.completeRows(request, rows, confirmRect) && rows != null) {
+                            state.setPaddle(rows)
+                            consumption.completed(token)
+                        }
+                    }
+                    ShopOcrOutcome.Cancelled, ShopOcrOutcome.SubmissionFailed,
+                    ShopOcrOutcome.ExecutionFailed -> state.cancel(request)
+                }
             }
         }
     }
@@ -168,15 +197,23 @@ internal class AndroidLabyrinthShopReceiptResolver(
         }
     }
 
-    /** 按参考矩形裁出六个字段，调用线程内完成（位图生命周期由调用方保证）。 */
-    private fun cropFields(bitmap: Bitmap): List<Bitmap> =
-        LABYRINTH_SHOP_RECEIPT_COLLAGE_FIELDS.mapNotNull { reference ->
-            val rect = ReferenceFitMapper.map(bitmap.width, bitmap.height, REFERENCE, reference)
-                ?: return@mapNotNull null
-            if (rect.width <= 0 || rect.height <= 0 ||
-                rect.left + rect.width > bitmap.width || rect.top + rect.height > bitmap.height) return@mapNotNull null
-            Bitmap.createBitmap(bitmap, rect.left, rect.top, rect.width, rect.height)
+    /** Preserve field positions even if a crop cannot be mapped; the sixth position is absent. */
+    private fun cropFields(bitmap: Bitmap): List<Bitmap?> {
+        val crops = mutableListOf<Bitmap?>()
+        try {
+            LABYRINTH_SHOP_RECEIPT_COLLAGE_FIELDS.take(5).forEach { reference ->
+                val rect = ReferenceFitMapper.map(bitmap.width, bitmap.height, REFERENCE, reference)
+                crops.add(if (rect == null || rect.width <= 0 || rect.height <= 0 ||
+                    rect.left + rect.width > bitmap.width || rect.top + rect.height > bitmap.height) null
+                    else Bitmap.createBitmap(bitmap, rect.left, rect.top, rect.width, rect.height))
+            }
+            crops.add(null)
+            return crops
+        } catch (failure: Exception) {
+            crops.forEach { it?.let { crop -> if (!crop.isRecycled) crop.recycle() } }
+            throw failure
         }
+    }
 
     /** 余额中间的橙色箭头会动画；只指纹真实交易文字，避免稳定回执被动画反复失效。 */
     private fun receiptFingerprint(bitmap: Bitmap): Long {
@@ -198,7 +235,7 @@ internal class AndroidLabyrinthShopReceiptResolver(
             rowHeight * LABYRINTH_SHOP_RECEIPT_COLLAGE_FIELDS.size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(collage)
         canvas.drawColor(Color.WHITE)
-        LABYRINTH_SHOP_RECEIPT_COLLAGE_FIELDS.forEachIndexed { index, referenceRect ->
+        LABYRINTH_SHOP_RECEIPT_COLLAGE_FIELDS.take(5).forEachIndexed { index, referenceRect ->
             val rect = ReferenceFitMapper.map(bitmap.width, bitmap.height, REFERENCE, referenceRect)
                 ?: return@forEachIndexed
             if (rect.width <= 0 || rect.height <= 0 ||

@@ -20,6 +20,7 @@ class LabyrinthShopAmountParsingTest {
         listOf("消耗阿尔法金币×1,234", "消耗阿爾法全币x1234", "消耗 阿尔法金币 X 1，234", "消耗阿尔法金币*1234")
             .forEach { text -> assertEquals(text, 1_234L, LabyrinthShopPurchaseReceiptObservation(expenditure = read(text)).spent) }
         listOf("消耗阿尔法金币×1O0", "消耗金币×100", "消耗阿尔法金币×1,23", "消耗阿尔法金币×-100",
+            "消耗阿尔法金币×\\d",
             "消耗阿尔法金币×100。", "阿尔法金币×100", "消耗阿尔法金币×1000000000")
             .forEach { assertNull(it, LabyrinthShopPurchaseReceiptObservation(expenditure = read(it)).spent) }
     }
@@ -49,20 +50,14 @@ class LabyrinthShopAmountParsingTest {
         assertFalse(LabyrinthShopPurchaseReceiptObservation().verified)
     }
 
-    @Test fun `商品和刷新费的双读价格以及总复核状态保持独立`() {
-        val item = item().copy(priceRead = read("100", 1))
-        assertNull(item.verifiedPrice)
-        val verified = item.copy(priceRead = read("100"))
-        assertEquals(100L, verified.verifiedPrice)
-        assertNull(item.copy(priceRead = read("0")).verifiedPrice)
-        assertNull(item.copy(priceRead = read("1O0")).verifiedPrice)
-        val shop = LabyrinthShopObservation(listOf(verified), refreshPriceRead = read("10"))
-        assertTrue(shop.pricesReviewed)
-        assertEquals(10L, shop.verifiedRefreshPrice)
-        assertFalse(shop.copy(items = listOf(item)).pricesReviewed)
-        assertFalse(shop.copy(refreshPriceRead = read("10", 1)).pricesReviewed)
-        assertFalse(shop.copy(priceReviewReason = "等待复核").pricesReviewed)
-        assertFalse(shop.copy(items = emptyList()).pricesReviewed)
+    @Test fun `商品价格是数值而钱包和回执仍独立双读`() {
+        val item = item().copy(price = 100L)
+        assertEquals(100L, item.price)
+        assertTrue(item.purchasable)
+        assertFalse(item.copy(price = 0L).purchasable)
+        assertNull(item.copy(price = null).price)
+        assertNull(LabyrinthCurrencyObservation(read("100", 1)).balance)
+        assertFalse(validReceipt().copy(balanceBefore = read("1000", 1)).verified)
     }
 
     @Test fun `钱包允许零余额且拒绝超上限`() {

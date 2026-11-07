@@ -31,6 +31,8 @@ internal enum class LabyrinthPostEntryActionKind {
     CLOSE_ITEM_REWARD,
 
     // Shop
+    SHOP_SCROLL_TOP,
+    SHOP_SCROLL_BOTTOM,
     SHOP_BUY_RELIC,
     SHOP_BUY_IMPRINT,
     SHOP_CONFIRM_RELIC,

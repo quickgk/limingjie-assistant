@@ -74,7 +74,11 @@ data class LabyrinthStrategySettings(
     val debuffPivotTolerance: Int = 2,
     val buyRelics: Boolean = true,
     val refreshShop: Boolean = true,
+    /** Empty retains the two built-in groups; explicit roles are ordered strongest first. */
+    val randomImprintRolePriority: List<LabyrinthImprintRole> = emptyList(),
     val refreshFromArea: Int = 5,
+    /** Explicit per-account enhancement input; absent accounts default to not acquired. */
+    val node21AcquiredAccountIds: Set<Long> = emptySet(),
     val normalWinRate: Int = 95,
     val extremeWinRate: Int = 70,
     val personalRoleScores: Map<String, Int> = emptyMap(),
@@ -134,10 +138,12 @@ data class LabyrinthStrategySettings(
         debuffPivotMinimum !in 5..15 -> "转追削弱的最低层数必须在 5–15 之间"
         debuffPivotTolerance !in 0..5 -> "削弱落后容忍层数必须在 0–5 之间"
         refreshFromArea !in 1..5 -> "商店刷新起始区域必须在 1–5 之间"
+        node21AcquiredAccountIds.any { it <= 0 } -> "商店折扣配置必须使用有效账号 ID"
         personalRoleScores.any { (id, score) -> !id.matches(Regex("[0-9]{4,6}")) || score !in 0..100 } ->
             "个人角色评分必须使用有效角色 ID，分数在 0–100 之间"
         openingRosterError() != null -> openingRosterError()
         relicMarkPriority.distinct().size != relicMarkPriority.size -> "遗物优先级不能重复"
+        randomImprintRolePriority.distinct().size != randomImprintRolePriority.size -> "随机印记职能优先级不能重复"
         else -> null
     }
 

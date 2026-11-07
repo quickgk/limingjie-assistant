@@ -256,6 +256,8 @@ class LandosolToolboxApplication : Application() {
         LabyrinthEntryRecognitionSession(
             shoppingJournal = shoppingJournal,
             shoppingModule = LabyrinthShoppingModule(shoppingJournal),
+            shoppingImprintCatalog = com.landosol.toolbox.labyrinth.shop.AndroidLabyrinthShopCatalogLoader(this).load(),
+            shoppingPurchaseBudgetCatalog = com.landosol.toolbox.labyrinth.shop.LabyrinthShopPurchaseBudgetCatalog(shoppingRelics),
             shoppingRelicResolver = { identity ->
                 val relic = shoppingRelics.singleOrNull { it.id == identity }
                     ?: shoppingRelics.singleOrNull { it.name.filterNot(Char::isWhitespace) == identity.filterNot(Char::isWhitespace) }
@@ -264,7 +266,8 @@ class LandosolToolboxApplication : Application() {
                     LabyrinthRelicMatch(
                         slotId = "shop_receipt_catalog", relicId = it.id, displayName = it.name,
                         attribute = it.mark.ifBlank { it.tags.firstOrNull().orEmpty() }.ifBlank { "特殊" },
-                        attributeBonus = it.markBonus, effect = it.effect, confidence = 1.0,
+                        attributeBonus = it.markBonus, effect = it.effect, confidence = 1.0, basePrice = it.price,
+                        rarity = it.rarity.toIntOrNull(),
                         screenRect = rect, iconRect = rect,
                     )
                 }
@@ -300,12 +303,18 @@ class LandosolToolboxApplication : Application() {
                     characterAttributes = characterAttributes,
                     finalBossOnly = finalBossOnly,
                     skipJoinedCharacters = { labyrinthEntryRecognitionSession.skipRoleRewardJoinedRecognition },
+                    shopStockEpoch = { labyrinthEntryRecognitionSession.currentShopStockEpoch() },
+                    shopPurchasedSlots = { labyrinthEntryRecognitionSession.currentShopPurchasedSlots() },
+                    shopWalletReadRequired = { labyrinthEntryRecognitionSession.shopWalletReadRequired() },
+                    onShopWalletChanged = { labyrinthEntryRecognitionSession.shopWalletChanged() },
                     nodeSearchHint = { labyrinthEntryRecognitionSession.currentNodeSearchHint() },
                     nodeScanRequested = { labyrinthEntryRecognitionSession.nodeScanRequested() },
                     nodeScanConsumable = { labyrinthEntryRecognitionSession.nodeScanConsumable() },
                     rosterCharacterIds = { labyrinthEntryRecognitionSession.rosterCharacterIds() },
                     captureFrameSize = CaptureStateRegistry::captureSize,
-                )::process
+                ).also { processor ->
+                    labyrinthEntryRecognitionSession.registerShopOcrInvalidator(processor::clearShopOcr)
+                }::process
             },
             captureStop = { MediaProjectionCaptureService.stop(this) },
             overlayCoordinator = automationOverlayCoordinator,

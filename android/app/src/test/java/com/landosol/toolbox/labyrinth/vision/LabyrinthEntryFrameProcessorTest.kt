@@ -34,7 +34,22 @@ class LabyrinthEntryFrameProcessorTest {
     private val processor by lazy(::createProcessor)
 
     @Test
-    fun dateChangePopupWinsGenericSessionErrorOnCurrentClient() {
+    fun `uniform white pixels cannot enter the trusted shop pipeline`() {
+        val assets = File(projectRoot, "android/app/src/main/assets")
+        val paths = AndroidLabyrinthEntryTemplateLoader.TEMPLATE_PATHS +
+            AndroidLabyrinthEntryTemplateLoader.OPTIONAL_TEMPLATE_PATHS.filterKeys { it in EntryAnchorId.required }
+        val templates = LabyrinthEntryTemplateSet(paths.mapValues { (_, path) ->
+            val file = File(assets, path)
+            assertTrue("missing packaged entry anchor: $path", file.isFile)
+            readImage(file)
+        })
+        val result = LabyrinthEntryFrameProcessor(templates = templates, shopRecognizer = LabyrinthShopRecognizer())
+            .process(PixelImage(1920, 1080, IntArray(1920 * 1080) { -1 }))
+        assertTrue(result.observation.state != LabyrinthEntryPageState.SHOP)
+        assertTrue(result.shopObservation == null)
+    }
+
+    @Test fun dateChangePopupWinsGenericSessionErrorOnCurrentClient() {
         val frame = readImage(
             File(
                 projectRoot,
@@ -422,7 +437,10 @@ class LabyrinthEntryFrameProcessorTest {
 
         val shop = recognizer.recognize(frame)
 
-        assertEquals(3, shop.items.size)
+        assertEquals(6, shop.items.size)
+        assertEquals(LabyrinthShopViewport.A, shop.viewport)
+        assertTrue(shop.items.drop(3).all { it.status == LabyrinthShopItemStatus.UNKNOWN })
+        val topItems = shop.items.take(3)
         assertEquals(
             shop.items.joinToString { item ->
                 "${item.slotId}:${item.relicMatch?.suspectedRelicId}" +
@@ -430,19 +448,19 @@ class LabyrinthEntryFrameProcessorTest {
                     "/margin=${item.relicMatch?.rivalMargin}"
             },
             listOf("14001", "25004", "15001"),
-            shop.items.map { it.relicMatch?.relicId },
+            topItems.map { it.relicMatch?.relicId },
         )
         assertTrue(
             shop.items.joinToString { "${it.slotId}:${it.relicMatch}" },
-            shop.items.all { it.relicMatch?.recognized == true },
+            topItems.all { it.relicMatch?.recognized == true },
         )
         assertTrue(
             shop.items.joinToString { "${it.slotId}:${it.status}/${it.buyButtonEnabledEvidence}" },
-            shop.items.all { it.status == LabyrinthShopItemStatus.AVAILABLE },
+            topItems.all { it.status == LabyrinthShopItemStatus.AVAILABLE },
         )
         assertTrue(
             shop.items.joinToString { "${it.slotId}:${it.buyButtonEnabledEvidence}" },
-            shop.items.all { it.buyButtonEnabledEvidence >= 0.80 },
+            topItems.all { it.buyButtonEnabledEvidence >= 0.80 },
         )
     }
 
@@ -1045,7 +1063,7 @@ class LabyrinthEntryFrameProcessorTest {
             )
             assertTrue("fixture=$fileName", result.observation.confidence >= 0.45)
             val shop = requireNotNull(result.shopObservation) { "fixture=$fileName" }
-            assertEquals("fixture=$fileName", 3, shop.items.size)
+            assertEquals("fixture=$fileName", if (expected == LabyrinthEntryPageState.SHOP) 6 else 0, shop.items.size)
             if (expected == LabyrinthEntryPageState.SHOP) {
                 assertTrue("fixture=$fileName shop=$shop", shop.recognizedButtonCount >= 2)
             }

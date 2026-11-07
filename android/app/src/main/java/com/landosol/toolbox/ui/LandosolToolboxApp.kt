@@ -337,6 +337,8 @@ private fun LabyrinthRoute(
     var strategySaving by remember { mutableStateOf(false) }
     var strategyMessage by remember { mutableStateOf<String?>(null) }
     val savedStrategy by application.labyrinthStrategySettings.state.collectAsStateWithLifecycle()
+    val strategyAccounts by remember(application) { application.accountRepository.observeAccounts() }
+        .collectAsStateWithLifecycle(initialValue = emptyList())
     if (showAccessibilityDialog) {
         AlertDialog(
             onDismissRequest = { showAccessibilityDialog = false },
@@ -362,6 +364,7 @@ private fun LabyrinthRoute(
         LabyrinthStrategySettingsScreen(
             loadRoleRatings = application::loadLabyrinthRoleRatings,
             saved = savedStrategy,
+            accounts = strategyAccounts,
             saving = strategySaving,
             message = strategyMessage,
             onClose = { showStrategies = false; strategyMessage = null },

@@ -706,6 +706,7 @@ class LabyrinthEntryFrameProcessor(
                 shopObservation = shopRecognizer.recognize(
                     frame = frame,
                     dialogState = observation.state.toShopDialogState(),
+                    modalVisible = nodeMoveConfirmation != null,
                 )
             }
             matchedFeatures = scores.entries

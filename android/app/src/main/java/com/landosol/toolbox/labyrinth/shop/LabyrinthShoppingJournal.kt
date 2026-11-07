@@ -1,6 +1,7 @@
 package com.landosol.toolbox.labyrinth.shop
 
 import java.io.File
+import com.landosol.toolbox.labyrinth.vision.ShopPerformance
 import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -23,15 +24,9 @@ class LabyrinthShoppingJournal(
 ) {
     // 同一目录的不同 facade / store 实例也必须串行读改写。
     internal val lock: Any = locks.computeIfAbsent(root.canonicalPath) { Any() }
+    private val parsedCache = caches.computeIfAbsent(root.canonicalPath) { linkedMapOf() }
+    private data class Parsed(val bytes: ByteArray, val events: List<JsonObject>)
     private val json = Json { prettyPrint = false }
-    /**
-     * 证据文件一旦原子落盘就不再改写，所以同一份 (路径, 摘要, 长度, mtime) 的校验结果可以复用。
-     *
-     * 没有这个缓存时，verifiedBalance / refreshStates / pendingOwnership 在一帧里会多次复核同一张
-     * 整帧 PNG，等于每帧反复读盘再算一遍 SHA-256。用长度和 mtime 参与键值，文件被替换或篡改时
-     * 键会变化，仍会重新读盘校验，不会把旧的「通过」套到新内容上。
-     */
-    private val evidenceChecks = ConcurrentHashMap<String, Boolean>()
 
     data class Run(val runId: String, val enterId: Long, val directory: File)
 
@@ -64,35 +59,8 @@ class LabyrinthShoppingJournal(
         outcome.failed.forEach { directory -> runCatching { onPruneFailure(directory) } }
     }
 
-    /** 回调必须编码未经标注、缩放的原图；未入账的孤立原图必须重新编码。 */
-    fun evidence(run: Run, eventId: String, encode: (FileOutputStream) -> Boolean): String = synchronized(lock) {
-        validateRun(run)
-        require(eventId.matches(EVENT_ID)) { "证据编号无效" }
-        val relative = "evidence/$eventId.png"
-        val file = containedFile(run, relative)
-        read(run).firstOrNull { it["event_id"]?.jsonPrimitive?.content == eventId }?.let { event ->
-            check(event["evidence_ref"]?.jsonPrimitive?.contentOrNull == relative && evidenceValid(run, event)) {
-                "已入账原图缺失或校验失败"
-            }
-            return@synchronized relative
-        }
-        check(file.parentFile!!.isDirectory || file.parentFile!!.mkdirs()) { "无法创建原图目录" }
-        val pending = containedFile(run, "$relative.tmp")
-        try {
-            FileOutputStream(pending).use { output ->
-                check(encode(output)) { "原始证据图编码失败" }
-                output.fd.sync()
-            }
-            check(pending.length() > 0) { "原始证据图为空" }
-            Files.move(pending.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-        } finally {
-            if (pending.exists()) check(pending.delete()) { "无法清理未完成原图" }
-        }
-        relative
-    }
-
     fun append(run: Run, eventId: String, type: String, nodeId: Long?, floor: Int?, now: Long,
-        payload: JsonObject, evidenceRef: String? = null, verification: String = "verified",
+        payload: JsonObject, verification: String = "verified",
         source: String = "actual_screen"): JsonObject = synchronized(lock) {
         validateRun(run)
         require(eventId.matches(EVENT_ID) && type.isNotBlank()) { "事件编号或类型无效" }
@@ -100,17 +68,9 @@ class LabyrinthShoppingJournal(
         events.firstOrNull { it["event_id"]?.jsonPrimitive?.content == eventId }?.let { event ->
             check(event["type"]?.jsonPrimitive?.content == type && event["payload"] == payload &&
                 event["node_id"] == JsonPrimitive(nodeId) && event["floor"] == JsonPrimitive(floor) &&
-                event["evidence_ref"] == JsonPrimitive(evidenceRef) &&
                 event["verification_status"]?.jsonPrimitive?.content == verification &&
                 event["source"]?.jsonPrimitive?.content == source) { "同一事件编号内容发生变化" }
-            if (evidenceRef != null) check(evidenceValid(run, event)) { "重复事件的原图校验失败" }
             return@synchronized event
-        }
-        val digest = evidenceRef?.let {
-            require(it.matches(EVIDENCE_PATH)) { "原图引用无效" }
-            val file = containedFile(run, it)
-            check(file.isFile && file.length() > 0) { "原始证据图不存在或为空" }
-            keyBytes(file.readBytes())
         }
         val event = buildJsonObject {
             put("schema_version", 1); put("run_id", run.runId); put("enter_id", run.enterId)
@@ -118,72 +78,79 @@ class LabyrinthShoppingJournal(
             put("node_id", JsonPrimitive(nodeId)); put("floor", JsonPrimitive(floor))
             put("timestamp_utc", Instant.ofEpochMilli(now).toString())
             put("source", source); put("verification_status", verification)
-            put("evidence_ref", JsonPrimitive(evidenceRef))
-            digest?.let { put("evidence_sha256", it) }
             put("payload", payload)
         }
+        parsedCache.remove(run.runId)
+        val appendStarted = System.nanoTime()
         FileOutputStream(containedFile(run, "events.jsonl"), true).use {
-            it.write((event.toString() + "\n").toByteArray(Charsets.UTF_8)); it.fd.sync()
+            it.write((event.toString() + "\n").toByteArray(Charsets.UTF_8))
+            val syncStarted = System.nanoTime()
+            it.fd.sync()
+            ShopPerformance.event("journal.sync", syncStarted, field = type)
         }
+        ShopPerformance.event("journal.append", appendStarted, field = type)
         event
     }
 
     fun read(run: Run): List<JsonObject> = synchronized(lock) {
-        validateRun(run)
-        val file = containedFile(run, "events.jsonl")
-        if (!file.exists()) return@synchronized emptyList()
-        val bytes = file.readBytes()
-        val completeLength = bytes.indexOfLast { it == '\n'.code.toByte() } + 1
-        val events = bytes.copyOf(completeLength).toString(Charsets.UTF_8).lineSequence()
-            .filter(String::isNotBlank).map { json.parseToJsonElement(it).jsonObject }.toList()
-        val ids = mutableSetOf<String>()
-        events.forEachIndexed { index, event ->
-            check(event["run_id"]?.jsonPrimitive?.content == run.runId &&
-                event["enter_id"]?.jsonPrimitive?.longOrNull == run.enterId &&
-                event["seq"]?.jsonPrimitive?.intOrNull == index + 1 &&
-                event["event_id"]?.jsonPrimitive?.content?.let { it.matches(EVENT_ID) && ids.add(it) } == true) {
-                "购物日志完整事件损坏或重复"
+        try {
+            validateRun(run)
+            validateManifest(run)
+            val file = containedFile(run, "events.jsonl")
+            if (!file.exists()) {
+                parsedCache.remove(run.runId)
+                return@synchronized emptyList()
             }
+            val readStarted = System.nanoTime()
+            val bytes = file.readBytes()
+            ShopPerformance.event("journal.read", readStarted, count = bytes.size.toLong())
+            parsedCache[run.runId]?.takeIf { it.bytes.contentEquals(bytes) }?.let {
+                ShopPerformance.event("journal.cache_hit", count = it.events.size.toLong())
+                return@synchronized it.events
+            }
+            parsedCache.remove(run.runId)
+            val parseStarted = System.nanoTime()
+            val completeLength = bytes.indexOfLast { it == '\n'.code.toByte() } + 1
+            val completeBytes = bytes.copyOf(completeLength)
+            val events = completeBytes.toString(Charsets.UTF_8).lineSequence()
+                .filter(String::isNotBlank).map { immutableJson(json.parseToJsonElement(it)).jsonObject }.toList()
+            val ids = mutableSetOf<String>()
+            events.forEachIndexed { index, event ->
+                check(event["run_id"]?.jsonPrimitive?.content == run.runId &&
+                    event["enter_id"]?.jsonPrimitive?.longOrNull == run.enterId &&
+                    event["seq"]?.jsonPrimitive?.intOrNull == index + 1 &&
+                    event["event_id"]?.jsonPrimitive?.content?.let { it.matches(EVENT_ID) && ids.add(it) } == true) {
+                    "购物日志完整事件损坏或重复"
+                }
+            }
+            ShopPerformance.event("journal.parse", parseStarted, count = events.size.toLong())
+            // 完整行损坏直接拒绝；只恢复中断追加的末尾，并先原子保存截断内容。
+            if (completeLength != bytes.size) {
+                atomicWrite(containedFile(run, "interrupted-tail-${UUID.randomUUID()}.bin"),
+                    bytes.copyOfRange(completeLength, bytes.size))
+                atomicWrite(file, completeBytes)
+            }
+            val snapshot = java.util.Collections.unmodifiableList(events)
+            if (parsedCache.size >= RETAINED_RUNS) parsedCache.remove(parsedCache.keys.first())
+            parsedCache[run.runId] = Parsed(completeBytes, snapshot)
+            snapshot
+        } catch (failure: Exception) {
+            parsedCache.remove(run.runId)
+            throw failure
         }
-        // 完整行损坏直接拒绝；只恢复中断追加的末尾，并先原子保存截断内容。
-        if (completeLength != bytes.size) {
-            atomicWrite(containedFile(run, "interrupted-tail-${UUID.randomUUID()}.bin"),
-                bytes.copyOfRange(completeLength, bytes.size))
-            atomicWrite(file, bytes.copyOf(completeLength))
-        }
-        events
     }
 
-    fun evidenceValid(run: Run, event: JsonObject): Boolean = synchronized(lock) {
-        runCatching {
-            validateRun(run)
-            if (event["run_id"]?.jsonPrimitive?.content != run.runId ||
-                event["enter_id"]?.jsonPrimitive?.longOrNull != run.enterId) return@runCatching false
-            val path = event["evidence_ref"]?.jsonPrimitive?.contentOrNull ?: return@runCatching false
-            if (!path.matches(EVIDENCE_PATH)) return@runCatching false
-            val expected = event["evidence_sha256"]?.jsonPrimitive?.contentOrNull ?: return@runCatching false
-            val file = containedFile(run, path)
-            if (!file.isFile || file.length() <= 0) return@runCatching false
-            val cacheKey = "${file.canonicalPath}|$expected|${file.length()}|${file.lastModified()}"
-            evidenceChecks[cacheKey] ?: run {
-                val valid = keyBytes(file.readBytes()) == expected
-                if (evidenceChecks.size > EVIDENCE_CACHE_LIMIT) evidenceChecks.clear()
-                evidenceChecks[cacheKey] = valid
-                valid
-            }
-        }.getOrDefault(false)
+    private fun immutableJson(value: JsonElement): JsonElement = when (value) {
+        is JsonObject -> JsonObject(java.util.Collections.unmodifiableMap(value.mapValues { immutableJson(it.value) }))
+        is JsonArray -> JsonArray(java.util.Collections.unmodifiableList(value.map(::immutableJson)))
+        else -> value
     }
 
     /**
-     * 只保留最近 [keep] 次 enter 的证据目录（含 [currentRunId] 那一次），其余整目录删除。
-     *
-     * 一次 enter 会为每次余额变化、购买和刷新各留一张整帧 PNG，目录只增不减会把设备存储吃满。
-     * 只删除本 journal 根下、名字是运行标识、且带 manifest 的目录；[currentRunId] 永不删除，
-     * 否则恢复一次较旧 enter 时会把它刚读完的目录当成旧运行删掉。静置时间按目录内文件的最大
-     * mtime 计算——目录自身的 mtime 只在增删直接子项时更新，追加日志和写证据都不会碰它。
-     * [now] 默认取墙钟：这里比较的是文件 mtime，与账本事件使用的会话时钟无关。
-     *
-     * 返回值区分「删掉了几次」和「哪几次没删干净」，调用方可以据此留下诊断，而不是只看到 0。
+     * 保留最近 [keep] 次 enter 的日志目录，包括 [currentRunId]。
+     * 只清理本根目录内有 manifest 的旧运行；当前运行永不删除。
+     * 静置时间取目录内文件最大 mtime，追加中的日志不会被误判为空闲。
+     * 返回删除数与未清理完的目录，便于记录诊断并重试。
      */
     fun pruneRuns(
         keep: Int = RETAINED_RUNS,
@@ -226,7 +193,7 @@ class LabyrinthShoppingJournal(
         directory.walkTopDown().filter { it.isFile }.maxOfOrNull { it.lastModified() } ?: directory.lastModified()
 
     /**
-     * 自底向上删除（含 evidence/ 等子目录）；只有目录真的消失才算删除成功。
+     * 自底向上删除运行目录及子项；只有目录真的消失才算删除成功。
      *
      * manifest 是清理的索引：其它节点全部删掉之后才删它；任一项删不掉就保留 manifest 并返回
      * false，下一次 prune 仍能看见这个目录继续清理。目录本身删不掉时把 manifest 原样写回（连
@@ -255,6 +222,22 @@ class LabyrinthShoppingJournal(
         return false
     }
 
+    /** 空日志也须核对运行清单，不能借伪造的 Run 写入其他账户或 enter。 */
+    private fun validateManifest(run: Run) {
+        val manifest = containedFile(run, "manifest.json")
+        check(manifest.isFile) { "购物运行清单缺失" }
+        val saved = json.parseToJsonElement(manifest.readText(Charsets.UTF_8)).jsonObject
+        val account = saved["account_id"]
+        check(account != null && (account == JsonNull ||
+            !account.jsonPrimitive.isString && account.jsonPrimitive.longOrNull != null)) { "购物清单账户无效" }
+        val accountId = account.jsonPrimitive.longOrNull
+        val expectedId = UUID.nameUUIDFromBytes("labyrinth-shopping:${accountId ?: "interactive"}:${run.enterId}"
+            .toByteArray(Charsets.UTF_8)).toString()
+        check(saved["schema_version"] == JsonPrimitive(1) && saved["scope"] == JsonPrimitive("shopping") &&
+            saved["run_id"] == JsonPrimitive(run.runId) && saved["enter_id"] == JsonPrimitive(run.enterId) &&
+            run.runId == expectedId) { "购物日志账户、enter 或运行清单不一致" }
+    }
+
     private fun validateRun(run: Run) {
         require(run.enterId > 0 && run.runId.matches(Regex("[a-f0-9-]{36}"))) { "购物记录标识无效" }
         require(run.directory.canonicalFile == File(root.canonicalFile, run.runId).absoluteFile &&
@@ -278,14 +261,13 @@ class LabyrinthShoppingJournal(
 
     companion object {
         private val locks = ConcurrentHashMap<String, Any>()
+        private val caches = ConcurrentHashMap<String, MutableMap<String, Parsed>>()
         private val EVENT_ID = Regex("[a-zA-Z0-9_-]+")
-        private val EVIDENCE_PATH = Regex("evidence/[a-zA-Z0-9_-]+\\.png")
         private val RUN_DIR = Regex("[a-f0-9-]{36}")
         /** 保留最近几次 enter 的证据；更早的运行已经提交过持有，不需要再回放。 */
         private const val RETAINED_RUNS = 4
         /** 目录静置多久才允许删除，避免误删仍在进行的运行。 */
         private const val RETAINED_RUN_AGE_MILLIS = 3_600_000L
-        private const val EVIDENCE_CACHE_LIMIT = 1_024
         fun key(value: String): String = keyBytes(value.toByteArray(Charsets.UTF_8))
         private fun keyBytes(value: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(value)
             .joinToString("") { "%02x".format(it) }

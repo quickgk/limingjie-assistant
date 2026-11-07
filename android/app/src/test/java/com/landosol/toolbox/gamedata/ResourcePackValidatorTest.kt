@@ -123,6 +123,13 @@ class ResourcePackValidatorTest {
             assertEquals("布武机(夏日)", characters.first { it.id == "1401" }.name)
             assertEquals("斑比(夏日)", characters.first { it.id == "1402" }.name)
             assertTrue(characters.any { it.aliases.contains("Hiyori") })
+            val summons = loaded.data.summonUnits!!.summonUnits
+            assertEquals(23, summons.size)
+            assertEquals(mapOf(1200 to 13, 1800 to 1, 2800 to 8, 3600 to 1), summons.groupingBy { it.price }.eachCount())
+            assertTrue(summons.none { it.price == LabyrinthSummonUnitResources.NON_SHOP_PRICE })
+            assertEquals("拉比林斯之主", loaded.data.relics.single { it.id == "50005" }.name)
+            assertEquals(28, loaded.data.relics.count { it.price == 0 })
+            assertTrue(loaded.data.relics.all { it.baseScore == 0 })
             val relic = loaded.data.relics.first { it.id == "11001" }
             assertEquals("加速", relic.mark)
             assertTrue(relic.effect.isNotBlank())

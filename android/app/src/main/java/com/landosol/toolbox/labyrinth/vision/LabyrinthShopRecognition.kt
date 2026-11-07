@@ -13,6 +13,66 @@ enum class LabyrinthShopDialogState {
     EXIT_CONFIRMATION,
 }
 
+internal val LABYRINTH_SHOP_CONFIRMATION_TITLE_RECT = EntryReferenceRect(560, 345, 758, 60)
+internal val LABYRINTH_SHOP_CONFIRMATION_BALANCE_RECT = EntryReferenceRect(935, 735, 190, 48)
+
+internal val LABYRINTH_SHOP_GENERIC_TITLE_RECT = EntryReferenceRect(850, 270, 220, 48)
+internal val LABYRINTH_SHOP_REFRESH_BALANCE_RECT = EntryReferenceRect(1260, 600, 150, 48)
+
+/** 仅识别当前商店上的实际通用双按钮框，不授予任何动作。 */
+internal fun labyrinthShopGenericDialogVisible(result: LabyrinthEntryFrameResult): Boolean =
+    result.nodeMoveConfirmation != null && result.shopObservation?.purchaseReceipt == null &&
+        result.observation.state in setOf(LabyrinthEntryPageState.SHOP, LabyrinthEntryPageState.UNKNOWN,
+            LabyrinthEntryPageState.SHOP_EXIT_CONFIRMATION) &&
+        result.observation.anchorScores[EntryAnchorId.SHOP_TITLE] >= 0.65
+
+/** 更新与退出共用蓝底模板；仅当前弹窗标题双读精确匹配后才可交给刷新意图。 */
+internal fun labyrinthShopRefreshDialogVisible(result: LabyrinthEntryFrameResult): Boolean =
+    labyrinthShopGenericDialogVisible(result) && result.observation.state != LabyrinthEntryPageState.SHOP_EXIT_CONFIRMATION &&
+        result.shopObservation?.refreshConfirmationTitle?.let {
+        it.confirmations >= 2 && it.text?.filterNot(Char::isWhitespace) == "更新确认"
+    } == true
+
+internal fun labyrinthShopExitDialogConfirmed(result: LabyrinthEntryFrameResult): Boolean =
+    labyrinthShopGenericDialogVisible(result) && result.shopObservation?.refreshConfirmationTitle?.let {
+        it.confirmations >= 2 && it.text?.filterNot(Char::isWhitespace) in setOf("商店确认", "退出确认")
+    } == true
+
+/** 标题缺读或单读期间只保留已有刷新意图，不能确认退出或消费。 */
+internal fun labyrinthShopGenericDialogReading(result: LabyrinthEntryFrameResult): Boolean =
+    labyrinthShopGenericDialogVisible(result) && result.shopObservation?.refreshConfirmationTitle.let {
+        it == null || it.confirmations < 2 || it.text.isNullOrBlank()
+    }
+
+/** 真实OCR覆盖相似模板分类；读取中或矛盾标题保持UNKNOWN，不继承退出确认许可。 */
+internal fun resolveShoppingGenericDialog(result: LabyrinthEntryFrameResult,
+    read: LabyrinthShopReceiptRead?): LabyrinthEntryFrameResult {
+    if (!labyrinthShopGenericDialogVisible(result)) return result
+    val exit = read?.let { it.confirmations >= 2 && it.text?.filterNot(Char::isWhitespace) in
+        setOf("商店确认", "退出确认") } == true &&
+        result.observation.anchorScores[EntryAnchorId.SHOP_EXIT_CONFIRMATION_TITLE] >= 0.65
+    return result.copy(
+        observation = result.observation.copy(state = if (exit) LabyrinthEntryPageState.SHOP_EXIT_CONFIRMATION
+            else LabyrinthEntryPageState.UNKNOWN),
+        shopObservation = (result.shopObservation ?: LabyrinthShopObservation(emptyList())).copy(
+            dialogState = if (exit) LabyrinthShopDialogState.EXIT_CONFIRMATION else LabyrinthShopDialogState.NONE,
+            refreshConfirmationTitle = read),
+    )
+}
+
+internal fun labyrinthCurrencyReadSource(result: LabyrinthEntryFrameResult): LabyrinthCurrencySource? {
+    if (result.shopObservation?.purchaseReceipt != null) return null
+    if (result.observation.state == LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION)
+        return if (result.shopObservation?.dialogState == LabyrinthShopDialogState.PURCHASE_CONFIRMATION)
+            LabyrinthCurrencySource.PURCHASE_CONFIRMATION else null
+    if (result.nodeMoveConfirmation != null) return if (labyrinthShopRefreshDialogVisible(result))
+        LabyrinthCurrencySource.REFRESH_CONFIRMATION else null
+    return when (result.observation.state) {
+        LabyrinthEntryPageState.SHOP, LabyrinthEntryPageState.NODE_SELECTION -> LabyrinthCurrencySource.WALLET
+        else -> null
+    }
+}
+
 enum class LabyrinthShopItemStatus {
     AVAILABLE,
     DISABLED,
@@ -44,12 +104,11 @@ data class LabyrinthShopItemMatch(
     val titleEvidenceId: Long? = null,
     val categoryState: LabyrinthShopCategoryState = LabyrinthShopCategoryState.READY,
     val categoryAttempt: Int = 0,
-    /** 当前商品价格必须经过两次独立OCR，不从星级推算。 */
-    val priceRead: LabyrinthShopReceiptRead? = null,
+    /** Resource price after the run's frozen discounts; null is unknown, zero is not listed. */
+    val price: Long? = null,
 ) {
-    val purchasable: Boolean get() = status == LabyrinthShopItemStatus.AVAILABLE
-    val verifiedPrice: Long? get() = priceRead?.takeIf { it.confirmations >= 2 }?.text
-        ?.let(LabyrinthShopPurchaseReceiptObservation::parseAmount)?.takeIf { it > 0 }
+    val purchasable: Boolean get() = status == LabyrinthShopItemStatus.AVAILABLE &&
+        price != 0L && relicMatch?.basePrice != 0
 }
 
 /** Pure helper so noisy shop-title OCR can be tested without Android/ML Kit. */
@@ -75,10 +134,17 @@ object LabyrinthShopItemText {
             }
         }
 
-    /**
-     * Coarse semantic gate: enough to prove this good is a role-imprint and therefore not a relic,
-     * even when OCR did not recover the exact role label safely.
-     */
+    /** 确认购买必须显式读出选择或随机，缺字或两者同时出现均不能猜测。 */
+    fun confirmedImprintChoice(text: String?): Boolean? {
+        val value = normalized(text)
+        return when {
+            value.contains("选择") && !value.contains("随机") -> true
+            value.contains("随机") && !value.contains("选择") -> false
+            else -> null
+        }
+    }
+
+    /** Coarse semantic gate; an uncertain role must still not be treated as a relic. */
     fun looksLikeRoleImprint(text: String?): Boolean {
         val value = normalized(text)
         if (value.contains("全体选择印记")) return true
@@ -93,7 +159,7 @@ object LabyrinthShopItemText {
      * Whether this imprint lets the player pick the character (选择印记) rather than rolling one
      * (随机印记).
      *
-     * The two are priced and titled alike and both are role imprints, but only the choice variant
+     * The variants share a role class but use separate catalog entries and prices. Only the choice variant
      * opens a full-roster 角色选择 page after purchase, which the run then has to answer.
      */
     fun isChoiceRoleImprint(text: String?): Boolean {
@@ -135,15 +201,23 @@ data class LabyrinthShopObservation(
     val refreshButtonEnabledEvidence: Double = 0.0,
     /** The relic shown in the purchase-confirmation dialog, if the icon is trusted. */
     val purchaseCandidate: LabyrinthRelicMatch? = null,
+    /** 当前购买确认弹窗的商品标题；商品卡和计划标签不能填入此字段。 */
+    val confirmationTitle: LabyrinthShopReceiptRead? = null,
     /** 疑似回执正在读取时也必须阻止底层商店操作。 */
     val purchaseReceipt: LabyrinthShopPurchaseReceiptObservation? = null,
-    val refreshPriceRead: LabyrinthShopReceiptRead? = null,
-    val priceReviewReason: String? = null,
+    val stockEpoch: Long = 0,
+    val viewport: LabyrinthShopViewport = LabyrinthShopViewport.UNKNOWN,
+    val contentOffset: Int = 0,
+    val viewportPixels: LabyrinthShopViewportPixels? = null,
+    val coverage: LabyrinthShopCoverage? = null,
+    /** 当前通用商店弹窗的标题独立双读；不使用计划或历史页面名称。 */
+    val refreshConfirmationTitle: LabyrinthShopReceiptRead? = null,
+    /** Absence comes from the empty card interior, never an unread or disabled button. */
+    val emptySlotIds: Set<String> = emptySet(),
 ) {
-    val verifiedRefreshPrice: Long? get() = refreshPriceRead?.takeIf { it.confirmations >= 2 }?.text
-        ?.let(LabyrinthShopPurchaseReceiptObservation::parseAmount)?.takeIf { it > 0 }
-    val pricesReviewed: Boolean get() = items.isNotEmpty() && items.all { it.verifiedPrice != null } &&
-        verifiedRefreshPrice != null && priceReviewReason == null
+    val stockComplete: Boolean get() = coverage?.let {
+        it.epoch == stockEpoch && it.complete(items)
+    } == true
     val availableItemCount: Int get() = items.count(LabyrinthShopItemMatch::purchasable)
     val recognizedButtonCount: Int get() = items.count { it.buyButtonScore >= BUTTON_MIN_CONFIDENCE }
     val refreshButtonEnabled: Boolean get() = refreshButtonEnabledEvidence >= 0.50
@@ -154,7 +228,7 @@ data class LabyrinthShopObservation(
 }
 
 /**
- * Reads the stable part of the shop layout, the three visible purchase controls, and relic icons.
+ * Reads six physical positions and the observed button translation between top and bottom views.
  * The purchase confirmation dialog contains a larger copy of the purchased relic icon. That icon
  * is used as the commit candidate; the run store is updated only after the following purchase-
  * complete dialog, so opening the shop or cancelling a purchase cannot add a relic.
@@ -179,16 +253,45 @@ class LabyrinthShopRecognizer(
     fun recognize(
         frame: PixelImage,
         dialogState: LabyrinthShopDialogState = LabyrinthShopDialogState.NONE,
+        modalVisible: Boolean = false,
     ): LabyrinthShopObservation {
-        val items = TOP_ROW_SLOTS.map { slot ->
+        if (dialogState != LabyrinthShopDialogState.NONE || modalVisible) {
+            return LabyrinthShopObservation(emptyList(), dialogState,
+                purchaseCandidate = if (dialogState == LabyrinthShopDialogState.PURCHASE_CONFIRMATION)
+                    recognizePurchaseCandidate(frame) else null)
+        }
+        // Search a shared vertical translation, rather than assigning categories to rows.
+        val offsets = (0..150 step 5).map { offset ->
+            offset to TOP_ROW_SLOTS.map { slot ->
+                buyButtonTemplate?.let { matcher.score(frame, map(frame,
+                    slot.buyButtonRect.copy(y = slot.buyButtonRect.y - offset)), it, minimumChannelScore = 0.0) } ?: 0.0
+            }
+        }
+        val best = offsets.maxWithOrNull(compareBy<Pair<Int, List<Double>>> {
+            it.second.count { score -> score >= minButtonConfidence }
+        }.thenBy { it.second.sum() })!!
+        val offset = best.first
+        val topVisible = TOP_ROW_SLOTS.mapIndexed { i, slot ->
+            best.second[i] >= minButtonConfidence || emptyCardInterior(frame,
+                slot.cardRect.copy(y = slot.cardRect.y - offset))
+        }.all { it }
+        val slots = (0..1).flatMap { row -> TOP_ROW_SLOTS.mapIndexed { column, slot ->
+            val dy = row * 380 - offset
+            slot.copy(id = LabyrinthShopSlots.keys[row * 3 + column],
+                cardRect = slot.cardRect.copy(y = slot.cardRect.y + dy),
+                buyButtonRect = slot.buyButtonRect.copy(y = slot.buyButtonRect.y + dy),
+                iconRect = slot.iconRect.copy(y = slot.iconRect.y + dy))
+        } }
+        val items = slots.map { slot ->
             val screenRect = map(frame, slot.cardRect)
             val buyButtonRect = map(frame, slot.buyButtonRect)
             val iconRect = map(frame, slot.iconRect)
-            val score = buyButtonTemplate?.let {
+            val fullyVisible = slot.buyButtonRect.y >= 202 && slot.buyButtonRect.y + slot.buyButtonRect.height <= 875
+            val score = if (fullyVisible) buyButtonTemplate?.let {
                 matcher.score(frame, buyButtonRect, it, minimumChannelScore = 0.0)
-            } ?: 0.0
-            val enabledEvidence = buyButtonEnabledEvidence(frame, buyButtonRect)
-            val relicMatch = matchRelic(frame, slot.id, screenRect, iconRect)
+            } ?: 0.0 else 0.0
+            val enabledEvidence = if (fullyVisible) buyButtonEnabledEvidence(frame, buyButtonRect) else 0.0
+            val relicMatch = if (offset <= 15 && topVisible) matchRelic(frame, slot.id, screenRect, iconRect) else null
             LabyrinthShopItemMatch(
                 slotId = slot.id,
                 screenRect = screenRect,
@@ -198,35 +301,47 @@ class LabyrinthShopRecognizer(
                 status = when {
                     score < minButtonConfidence -> LabyrinthShopItemStatus.UNKNOWN
                     enabledEvidence >= MIN_ENABLED_BUTTON_EVIDENCE -> LabyrinthShopItemStatus.AVAILABLE
-                    else -> LabyrinthShopItemStatus.DISABLED
+                    enabledEvidence <= 0.20 -> LabyrinthShopItemStatus.DISABLED
+                    else -> LabyrinthShopItemStatus.UNKNOWN
                 },
                 relicMatch = relicMatch,
-                kind = if (relicMatch?.recognized == true) {
-                    LabyrinthShopItemKind.RELIC
-                } else {
-                    LabyrinthShopItemKind.UNKNOWN
-                },
+                kind = if (relicMatch?.recognized == true) LabyrinthShopItemKind.RELIC else LabyrinthShopItemKind.UNKNOWN,
             )
         }
-        val purchaseCandidate = if (dialogState == LabyrinthShopDialogState.PURCHASE_CONFIRMATION) {
-            val trustedCandidates = PURCHASE_DIALOG_ICON_RECTS.mapNotNull { referenceRect ->
-                val dialogIconRect = map(frame, referenceRect)
-                matchRelic(frame, "shop_purchase_confirmation", dialogIconRect, dialogIconRect)
-                    ?.takeIf(LabyrinthRelicMatch::recognized)
-            }
-            // Layout variants should identify the same relic. If two trusted ROIs disagree,
-            // keep the confirmation blocked instead of choosing the numerically larger score.
-            val trustedIds = trustedCandidates.mapNotNull(LabyrinthRelicMatch::relicId).distinct()
-            if (trustedIds.size == 1) trustedCandidates.maxByOrNull(LabyrinthRelicMatch::confidence) else null
-        } else {
-            null
+        val emptySlots = slots.filter { emptyCardInterior(frame, it.cardRect) }.mapTo(mutableSetOf()) { it.id }
+        val viewport = when {
+            !topVisible || best.second.none { it >= minButtonConfidence } -> LabyrinthShopViewport.UNKNOWN
+            offset <= 15 -> LabyrinthShopViewport.A
+            offset in 65..150 && items.all { it.buyButtonScore >= minButtonConfidence || it.slotId in emptySlots } -> LabyrinthShopViewport.B
+            else -> LabyrinthShopViewport.UNKNOWN
         }
         return LabyrinthShopObservation(
             items = items,
             dialogState = dialogState,
             refreshButtonEnabledEvidence = buyButtonEnabledEvidence(frame, map(frame, REFRESH_BUTTON_RECT)),
-            purchaseCandidate = purchaseCandidate,
+            viewport = viewport,
+            contentOffset = offset,
+            viewportPixels = if (dialogState == LabyrinthShopDialogState.NONE) LabyrinthShopViewportPixels.sample(frame) else null,
+            emptySlotIds = emptySlots,
         )
+    }
+
+    private fun emptyCardInterior(frame: PixelImage, rect: EntryReferenceRect): Boolean {
+        val visibleTop = maxOf(rect.y + 15, 202)
+        val visibleBottom = minOf(rect.y + rect.height - 15, 875)
+        if (visibleBottom - visibleTop < 220) return false
+        return LabyrinthShopEmptySlotEvidence.matches(frame, map(frame,
+            EntryReferenceRect(rect.x + 30, visibleTop, rect.width - 60, visibleBottom - visibleTop)))
+    }
+
+    private fun recognizePurchaseCandidate(frame: PixelImage): LabyrinthRelicMatch? {
+        val trustedCandidates = PURCHASE_DIALOG_ICON_RECTS.mapNotNull { referenceRect ->
+            val rect = map(frame, referenceRect)
+            matchRelic(frame, "shop_purchase_confirmation", rect, rect)?.takeIf(LabyrinthRelicMatch::recognized)
+        }
+        // All trusted layout variants must agree on the exact relic identity.
+        val trustedIds = trustedCandidates.mapNotNull(LabyrinthRelicMatch::relicId).distinct()
+        return if (trustedIds.size == 1) trustedCandidates.maxByOrNull(LabyrinthRelicMatch::confidence) else null
     }
 
     private fun map(frame: PixelImage, rect: EntryReferenceRect): EntryPixelRect =
@@ -298,6 +413,8 @@ class LabyrinthShopRecognizer(
             attribute = template?.attribute,
             attributeBonus = template?.attributeBonus,
             effect = template?.effect,
+            basePrice = template?.basePrice,
+            rarity = template?.rarity,
             confidence = score,
             screenRect = screenRect,
             iconRect = iconRect,
@@ -392,16 +509,36 @@ internal class AlignedRgbRelicMatcher(
                 template to coarseScore
             } else {
                 var best = coarseScore
+                var bestX = 0
+                var bestY = 0
                 var dx = -radiusX
                 while (dx <= radiusX) {
                     var dy = -radiusY
                     while (dy <= radiusY) {
                         if (dx != 0 || dy != 0) {
-                            best = max(best, score(frame, rect, template.image, dx, dy))
+                            val candidate = score(frame, rect, template.image, dx, dy)
+                            if (candidate > best) { best = candidate; bestX = dx; bestY = dy }
                         }
                         dy += stepY
                     }
                     dx += stepX
+                }
+                // At a 155 px shop icon the coarse grid advances two pixels, so it can miss
+                // a one-pixel alignment and turn a clear icon into a low-margin candidate.
+                // Refine every shortlisted competitor equally, using the same pixels/metric,
+                // within the original radius. This is one bounded neighborhood, not hill climbing.
+                val centerX = bestX
+                val centerY = bestY
+                if (stepX > 1 || stepY > 1) {
+                    for (fineX in maxOf(-radiusX, centerX - 1)..minOf(radiusX, centerX + 1)) {
+                        for (fineY in maxOf(-radiusY, centerY - 1)..minOf(radiusY, centerY + 1)) {
+                            if (fineX == centerX && fineY == centerY) continue
+                            val onCoarseGrid = (fineX + radiusX) % stepX == 0 &&
+                                (fineY + radiusY) % stepY == 0
+                            if (onCoarseGrid || (fineX == 0 && fineY == 0)) continue
+                            best = max(best, score(frame, rect, template.image, fineX, fineY))
+                        }
+                    }
                 }
                 template to best
             }

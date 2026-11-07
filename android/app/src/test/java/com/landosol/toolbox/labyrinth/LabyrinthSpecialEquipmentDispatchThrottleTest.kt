@@ -424,13 +424,17 @@ class LabyrinthSpecialEquipmentDispatchThrottleTest {
         kind: LabyrinthCombatKind?,
         settings: LabyrinthStrategySettings?,
     ): LabyrinthEntryRecognitionSession {
-        val manager = AutomationSessionManager()
+        val now = java.util.concurrent.atomic.AtomicLong(0L)
+        val manager = AutomationSessionManager(now::get)
+        LabyrinthBattleUiTestClock.start(manager)
         val created = LabyrinthEntryRecognitionSession(
             sessionManager = manager,
             processorFactory = { { error("测试不投喂帧") } },
             actionExecutor = SessionBoundActionExecutor(manager) { AutomationBackendResult.Completed },
             actionsAvailable = { true },
+            clock = now::get,
         )
+        LabyrinthBattleUiTestClock.register(created, now)
         setField(created, "activeSessionId", SESSION_ID)
         setField(created, "specialEquipmentSettings", settings)
         if (kind != null) setField(created, "combatContext", LabyrinthCombatContext(kind))
@@ -689,8 +693,8 @@ class LabyrinthSpecialEquipmentDispatchThrottleTest {
     /**
      * 放掉单动作锁（`actionInFlight`）。
      *
-     * 真实运行时由动作协程的 finally 释放；单元测试里动作只会得到 `StaleSession`，释放时机不确定，
-     * 所以需要连续两次派发的用例显式放锁，断言才是确定性的。
+     * Real callbacks are awaited by the test clock. This helper releases only the synthetic latch
+     * installed by holdActionLatch; normal execution releases its own latch in finally.
      */
     private fun releaseActionLatch(session: Any) {
         setField(session, "actionInFlight", AtomicBoolean(false))
@@ -723,6 +727,7 @@ class LabyrinthSpecialEquipmentDispatchThrottleTest {
      * 编译后既可能被拆成 `long`、方法名也可能被加后缀改写，两种形态都支持）。
      */
     private fun invoke(session: Any, name: String, vararg arguments: Any?): Any? {
+        LabyrinthBattleUiTestClock.before(session, name, arguments)
         val all = session.javaClass.declaredMethods.filter { it.name.startsWith(name) }
         val method = all.firstOrNull {
             (it.name == name || it.name.startsWith("$name-")) && it.parameterCount == arguments.size
@@ -741,7 +746,9 @@ class LabyrinthSpecialEquipmentDispatchThrottleTest {
                 else -> argument
             }
         }.toTypedArray()
-        return method.invoke(session, *adapted)
+        val result = method.invoke(session, *adapted)
+        LabyrinthBattleUiTestClock.after(session)
+        return result
     }
 
     private companion object {

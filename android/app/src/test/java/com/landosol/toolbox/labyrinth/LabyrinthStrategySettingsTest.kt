@@ -5,6 +5,17 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class LabyrinthStrategySettingsTest {
+    @Test fun `account node21 settings default empty and round trip independently`() {
+        assertTrue(LabyrinthStrategySettings().node21AcquiredAccountIds.isEmpty())
+        assertTrue(LabyrinthStrategySettingsCodec.decode("{\"playerWeight\":50}").node21AcquiredAccountIds.isEmpty())
+        val settings = LabyrinthStrategySettings(node21AcquiredAccountIds = setOf(7L, Long.MAX_VALUE))
+        val decoded = LabyrinthStrategySettingsCodec.decode(LabyrinthStrategySettingsCodec.encode(settings))
+        assertEquals(setOf(7L, Long.MAX_VALUE), decoded.node21AcquiredAccountIds)
+        assertFalse(8L in decoded.node21AcquiredAccountIds)
+        assertEquals(setOf(Long.MAX_VALUE), decoded.copy(node21AcquiredAccountIds = decoded.node21AcquiredAccountIds - 7L).node21AcquiredAccountIds)
+        assertNotNull(settings.copy(node21AcquiredAccountIds = setOf(0L)).validationError())
+    }
+
     @Test fun `defaults preserve current production scoring and choice rules`() {
         val original = productionDocument()
         assertEquals(original, LabyrinthStrategySettings().applyTo(original))

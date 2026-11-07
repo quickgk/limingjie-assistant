@@ -10,6 +10,9 @@ data class LabyrinthRelicTemplate(
     val attributeBonus: String,
     val effect: String,
     val image: PixelImage,
+    /** Null means missing metadata; zero is a non-shop relic, not free. */
+    val basePrice: Int? = null,
+    val rarity: Int? = null,
 )
 
 data class LabyrinthRelicMatch(
@@ -31,6 +34,8 @@ data class LabyrinthRelicMatch(
     val currentMarkStacks: Int? = null,
     val currentMarkStacksEvidenceText: String? = null,
     val currentMarkStacksEvidenceId: Long? = null,
+    val basePrice: Int? = null,
+    val rarity: Int? = null,
 ) {
     val recognized: Boolean get() = relicId != null
 }
@@ -137,6 +142,8 @@ class LabyrinthRelicRecognizer(
             attribute = template?.attribute,
             attributeBonus = template?.attributeBonus,
             effect = template?.effect,
+            basePrice = template?.basePrice,
+            rarity = template?.rarity,
             confidence = score,
             screenRect = screenRect,
             selectionButtonRect = selectionButtonRect,

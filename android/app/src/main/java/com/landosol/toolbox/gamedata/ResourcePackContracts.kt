@@ -74,6 +74,7 @@ data class RelicResource(
     val markBonus: String = "",
     val unlockCondition: String = "",
     val baseScore: Int = 0,
+    /** Zero means not listed in shops (initial/unavailable relics), never a free item. */
     val price: Int = 0,
     val notes: String = "",
     val references: ResourceReferences = ResourceReferences(),
@@ -126,6 +127,7 @@ data class ResourcePackData(
     val icons: GameIconPackDocument? = null,
     val eventOcr: LabyrinthEventOcrDocument? = null,
     val resolvedEventSignatures: List<ResolvedEventTextSignature> = emptyList(),
+    val summonUnits: LabyrinthSummonUnitDocument? = null,
 )
 
 sealed interface ResourcePackLoadResult {
@@ -166,6 +168,7 @@ class ResourcePackDataValidator {
             if (relic.baseScore < 0) add("遗物 ${relic.id} 评分不能为负数")
             if (relic.price < 0) add("遗物 ${relic.id} 价格不能为负数")
         }
+        data.summonUnits?.let { addAll(LabyrinthSummonUnitResources.validate(it)) }
         data.bosses.forEach { boss ->
             if (boss.area <= 0) add("Boss ${boss.id} 区域必须大于 0")
         }
@@ -270,6 +273,9 @@ class ResourcePackLoader(
             val relics = decodeCategory<RelicResource>(root, fileNames, "relics")
             val bosses = decodeCategory<BossResource>(root, fileNames, "bosses")
             val events = decodeCategory<EventResource>(root, fileNames, "events")
+            val summonUnits = if (LabyrinthSummonUnitResources.FILE_NAME in fileNames) {
+                LabyrinthSummonUnitResources.decode(File(root, LabyrinthSummonUnitResources.FILE_NAME).readText())
+            } else null
             val eventOcr = if (LabyrinthEventOcrLoader.FILE_NAME in fileNames) {
                 val sourceWorkbook = workbook
                     ?: return ResourcePackLoadResult.Failure(
@@ -325,6 +331,7 @@ class ResourcePackLoader(
                 icons = icons,
                 eventOcr = eventOcr?.document,
                 resolvedEventSignatures = eventOcr?.resolvedSignatures.orEmpty(),
+                summonUnits = summonUnits,
             )
             val validation = validator.validate(data)
             if (validation.isNotEmpty()) ResourcePackLoadResult.Failure(validation)

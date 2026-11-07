@@ -11,6 +11,8 @@ import com.landosol.toolbox.labyrinth.LabyrinthEntryRecognitionSessionState
 import com.landosol.toolbox.labyrinth.LabyrinthEventChoiceDecision
 import com.landosol.toolbox.labyrinth.vision.EntryPixelRect
 import com.landosol.toolbox.labyrinth.vision.LabyrinthEntryFrameResult
+import com.landosol.toolbox.labyrinth.vision.ShopPerformance
+import com.landosol.toolbox.labyrinth.vision.BoundedShopPerformanceRecorder
 import com.landosol.toolbox.labyrinth.vision.PaddleTextDetector
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -77,6 +79,7 @@ class LabyrinthDebugDashboardServer(
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
+        ShopPerformance.recorder = BoundedShopPerformanceRecorder(256)
         val server = runCatching {
             ServerSocket().apply {
                 reuseAddress = true
@@ -108,6 +111,7 @@ class LabyrinthDebugDashboardServer(
         val shouldRefreshJpeg = previous.jpeg == null ||
             lastJpegAt == Long.MIN_VALUE ||
             nowMillis - lastJpegAt >= JPEG_REFRESH_INTERVAL_MILLIS
+        val jpegStarted = System.nanoTime()
         val jpeg = if (shouldRefreshJpeg) {
             ByteArrayOutputStream().use { output ->
                 bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, output)
@@ -116,13 +120,18 @@ class LabyrinthDebugDashboardServer(
         } else {
             previous.jpeg
         }
+        if (shouldRefreshJpeg) ShopPerformance.event("diagnostic.jpeg", jpegStarted, capture = nowMillis)
         val version = if (shouldRefreshJpeg) previous.frameVersion + 1L else previous.frameVersion
         val jpegMillis = if (shouldRefreshJpeg) nowMillis else previous.jpegMillis
         latestJpegMillis = jpegMillis
+        val archiveStarted = System.nanoTime()
         val archivedFrame = archiveFrame(bitmap, state.frameCount)
+        ShopPerformance.event("diagnostic.archive", archiveStarted, capture = nowMillis)
+        val jsonStarted = System.nanoTime()
         val json = buildJson(state, result, presentation, version, nowMillis, archivedFrame, jpegMillis)
             .toString()
             .toByteArray(Charsets.UTF_8)
+        ShopPerformance.event("diagnostic.json", jsonStarted, capture = nowMillis)
         latest.set(Snapshot(json = json, jpeg = jpeg, frameVersion = version, jpegMillis = jpegMillis))
         synchronized(historyLock) {
             recentStates.addLast(json)
@@ -510,6 +519,22 @@ class LabyrinthDebugDashboardServer(
         put("page", result.observation.state.name)
         put("pageConfidence", result.observation.confidence)
         put("pageReason", result.observation.reason ?: JSONObject.NULL)
+        put("shopPerformance", JSONObject().apply {
+            put("clock", "monotonic-nanoseconds")
+            put("counts", JSONObject(ShopPerformance.counts()))
+            put("events", JSONArray().apply {
+                ShopPerformance.drain().forEach { event -> put(JSONObject().apply {
+                    put("name", event.name); put("atNanos", event.atNanos); put("durationNanos", event.durationNanos)
+                    put("field", event.field ?: JSONObject.NULL); put("scope", event.scope ?: JSONObject.NULL)
+                    put("visit", event.visit); put("generation", event.generation)
+                    put("captureSequence", event.captureSequence); put("requestSequence", event.requestSequence)
+                    put("consumingCaptureSequence", event.consumingCaptureSequence)
+                    put("stage", event.stage ?: JSONObject.NULL); put("action", event.action ?: JSONObject.NULL)
+                    put("transactionId", event.transactionId ?: JSONObject.NULL)
+                    put("count", event.count)
+                }) }
+            })
+        })
         fun engineReadJson(read: com.landosol.toolbox.labyrinth.vision.LabyrinthShopReceiptPaddleRead?): Any =
             read?.let { engine ->
                 JSONObject().apply {
@@ -765,11 +790,24 @@ class LabyrinthDebugDashboardServer(
                 }
             },
         )
+        fun shoppingReadJson(read: com.landosol.toolbox.labyrinth.vision.LabyrinthShopReceiptRead?): Any =
+            read?.let { JSONObject().apply {
+                put("text", it.text ?: JSONObject.NULL)
+                put("evidenceId", it.evidenceId)
+                put("confirmations", it.confirmations)
+            } } ?: JSONObject.NULL
+        put("currencyObservation", result.currencyObservation?.let { currency -> JSONObject().apply {
+            put("source", currency.source.name)
+            put("read", shoppingReadJson(currency.read))
+            put("balance", currency.balance ?: JSONObject.NULL)
+        } } ?: JSONObject.NULL)
         put(
             "shop",
             result.shopObservation?.let { shop ->
                 JSONObject().apply {
                     put("dialogState", shop.dialogState.name)
+                    put("confirmationTitle", shoppingReadJson(shop.confirmationTitle))
+                    put("refreshConfirmationTitle", shoppingReadJson(shop.refreshConfirmationTitle))
                     put("availableItemCount", shop.availableItemCount)
                     put("recognizedButtonCount", shop.recognizedButtonCount)
                     put("refreshButtonEnabled", shop.refreshButtonEnabled)

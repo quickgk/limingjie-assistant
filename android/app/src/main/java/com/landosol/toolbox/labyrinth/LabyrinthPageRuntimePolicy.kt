@@ -1080,7 +1080,13 @@ internal fun labyrinthSpecialEquipmentDecision(
 
         LabyrinthSpecialEquipmentFlowStage.AWAIT_SECOND_MAIN_DIALOG -> when (dialog) {
             LabyrinthSpecialEquipmentStage.MAIN_DIALOG -> equipDecision(observation, equipConfirmEnabled)
-            LabyrinthSpecialEquipmentStage.AUTO_DIALOG -> autoConfirmDecision(observation)
+            LabyrinthSpecialEquipmentStage.AUTO_DIALOG -> if (
+                sinceLastStepDispatchMillis < SPECIAL_EQUIPMENT_STEP_RETRY_INTERVAL_MILLIS
+            ) {
+                waitFor(stage, "特别装备：已点击弹窗2「确认」，等待返回弹窗1（不连续重试）")
+            } else {
+                autoConfirmDecision(observation)
+            }
             null -> LabyrinthSpecialEquipmentDecision(
                 stage = LabyrinthSpecialEquipmentFlowStage.DONE,
                 tap = null,

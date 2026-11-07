@@ -10,21 +10,19 @@ import kotlinx.serialization.json.longOrNull
 /**
  * 待决购买意图的回收判定。
  *
- * 购买意图持久化在 ledger 里，只能靠财务回执结算；预算租约（[ShoppingBudgetLease]）只在内存里，
- * 页面一变就失效。两者一旦脱钩，意图会永久悬空，把之后每个商店页和 UNKNOWN 页都拦成人工控制，
- * BOSS 特别装备流程也会跟着卡住。
+ * 购买意图持久化在 ledger 中，由回执或明确放弃事件结束。
+ * 无法得到当前确认身份和钱包时仍需安全回收出口，不能让旧意图阻塞后面的节点。
  *
- * 这里只做纯判定，不碰状态；真正的作废动作由 `LabyrinthShoppingModule.cancelIntent` 落成
- * ledger 事件，因此「为什么作废」在诊断包里可查。
+ * 这里只做纯判定，不碰状态；调用方用 `LabyrinthShoppingModule.abandonPurchase` 结束等待，
+ * 不把未知执行结果当成取消，也不补写交易事实。
  */
 internal object LabyrinthShoppingIntentGuard {
 
     /**
-     * 意图超过这个时长仍未结算，视为已经交回人工：作废后继续跑，而不是无限 hold。
+     * 意图超过这个时长仍未结算，视为已经交回人工：作废后继续跑。
      *
-     * **必须大于 `SHOPPING_HOLD_TIMEOUT_MILLIS`（180s）**。连续 hold 满 180 秒时，保守策略是
-     * 停止整局并保留诊断，那个出口优先；这条超时只在「页面反复变化、hold 计时被不断打断、
-     * 整局一直不停」的场景里兜底。
+     * 独立于连续 hold 的兜底年龄，防止页面进展反复刷新等待计时。
+     * 超过年龄后由调用方放弃本店等待，未知结果交回人工核实。
      */
     const val ABANDON_MILLIS = 240_000L
 
@@ -42,7 +40,7 @@ internal object LabyrinthShoppingIntentGuard {
     /**
      * 是否该按超时作废。
      *
-     * 年龄未知时返回 false：宁可继续 hold 等人工，也不误清一次可能真实发生的购买。
+     * 年龄未知时返回 false，继续等待回执或人工处理。
      */
     fun shouldAbandon(ageMillis: Long?): Boolean =
         ageMillis != null && ageMillis > ABANDON_MILLIS
@@ -51,7 +49,7 @@ internal object LabyrinthShoppingIntentGuard {
      * 意图是否已经离开它所属的节点/层。
      *
      * 已经换了节点，这次购买不可能还在这张图上，无需再为它保留人工控制。
-     * 任一方的节点或层未知时返回 false —— 拿不准就不动。
+     * 任一方的节点或层未知时返回 false，保持原状。
      */
     fun movedAway(intent: JsonObject, nodeId: Long?, floor: Int?): Boolean {
         val intentNode = intent["node_id"]?.jsonPrimitive?.longOrNull ?: return false

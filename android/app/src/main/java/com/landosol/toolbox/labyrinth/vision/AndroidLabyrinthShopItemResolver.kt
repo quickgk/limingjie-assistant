@@ -5,8 +5,9 @@ import android.graphics.Bitmap
 /** 快速路径和普通路径共用回退：否定结果不能再次抢占已识别页面。 */
 internal fun resolveShopReceiptOrPage(
     receipt: LabyrinthEntryFrameResult?,
+    invalidateStock: () -> Unit = {},
     page: () -> LabyrinthEntryFrameResult,
-): LabyrinthEntryFrameResult = receipt ?: page()
+): LabyrinthEntryFrameResult = receipt?.also { invalidateStock() } ?: page()
 
 /** Every visible title is classified before a relic match can authorize a purchase. */
 internal class AndroidLabyrinthShopItemResolver(
@@ -14,56 +15,128 @@ internal class AndroidLabyrinthShopItemResolver(
     submitReceiptLines: (Bitmap, (List<LabyrinthShopOcrLine>?) -> Unit) -> Unit = AndroidChineseRoleNameOcr::readElementsAsync,
     /** 回执字段的主读（PP-OCRv4）。 */
     paddle: PaddleReceiptOcr? = null,
+    private val runtime: AndroidShopOcrRuntime = AndroidShopOcrRuntime(paddle, submitTextRead),
 ) {
-    private val receiptResolver = AndroidLabyrinthShopReceiptResolver(submit = submitReceiptLines, paddle = paddle)
-    private val ocr = AndroidRelicRoiOcr(submitTextRead, maximumAttempts = 1)
+    private val receiptResolver = AndroidLabyrinthShopReceiptResolver(submit = submitReceiptLines, paddle = paddle, runtime = runtime)
+    private val ocr = AndroidShopRoiOcr(runtime, "stock-titles", maximumAttempts = 1)
+    private val confirmationOcr = AndroidShopRoiOcr(runtime, "confirmation-title")
+    private val genericDialogOcr = AndroidShopRoiOcr(runtime, "generic-dialog-title")
     private val categories = LabyrinthShopCategoryResolution()
-    private val accepted = mutableMapOf<String, Pair<Long, RelicOcrScheduler.Read>>()
+    private data class AcceptedTitle(val rect: EntryPixelRect, val fingerprint: Long, val read: RelicOcrScheduler.Read)
+    private val accepted = mutableMapOf<String, AcceptedTitle>()
+    private var stockEpoch = Long.MIN_VALUE
+    private var titleViewport: LabyrinthShopViewport? = null
 
-    fun fastReceipt(bitmap: Bitmap, shopTitleScore: () -> Double): LabyrinthEntryFrameResult? {
+    @Synchronized fun bindStockEpoch(epoch: Long) {
+        if (stockEpoch == epoch) return
+        stockEpoch = epoch
+        clearStockTitles()
+        confirmationOcr.clear()
+        genericDialogOcr.clear()
+        receiptResolver.bindScope(epoch.toString())
+    }
+
+    @Synchronized fun clear() {
+        clearStockTitles()
+        confirmationOcr.clear()
+        genericDialogOcr.clear()
+        receiptResolver.clear()
+    }
+
+    @Synchronized fun clearStockTitles() {
+        ocr.clear()
+        categories.clear()
+        accepted.clear()
+        titleViewport = null
+    }
+
+    @Synchronized
+    fun fastReceipt(bitmap: Bitmap, frame: AndroidFrameRoiFingerprints, shopTitleScore: () -> Double): LabyrinthEntryFrameResult? {
         if (bitmap.width <= bitmap.height || !modalShellVisible(bitmap) || shopTitleScore() < 0.65) {
             receiptResolver.clear()
             return null
         }
-        return receiptResolver.resolve(bitmap)
+        clearStockTitles()
+        return receiptResolver.resolve(bitmap, frame).also { if (it != null) {
+            confirmationOcr.clear()
+            genericDialogOcr.clear()
+        } }
     }
 
-    @Synchronized
-    fun resolve(bitmap: Bitmap, result: LabyrinthEntryFrameResult): LabyrinthEntryFrameResult {
+    @Synchronized fun resolve(bitmap: Bitmap, result: LabyrinthEntryFrameResult, frame: AndroidFrameRoiFingerprints,
+        purchasedSlots: Set<String> = emptySet()): LabyrinthEntryFrameResult {
         val scores = result.observation.anchorScores
         // 外框只启动OCR；成功与点击仍须标题、字段双读、余额差额及确认矩形共同核验。
         val receiptShell = modalShellVisible(bitmap) &&
             (scores[EntryAnchorId.SHOP_TITLE] >= 0.65 ||
                 result.observation.state == LabyrinthEntryPageState.SHOP_PURCHASE_COMPLETE)
-        val receipt = if (receiptShell) receiptResolver.resolve(bitmap) else {
+        if (receiptShell) clearStockTitles()
+        val receipt = if (receiptShell) receiptResolver.resolve(bitmap, frame) else {
             receiptResolver.clear()
             null
         }
         val resolved = resolveShopReceiptOrPage(receipt?.let {
+            confirmationOcr.clear()
+            genericDialogOcr.clear()
             result.copy(observation = it.observation, shopObservation = it.shopObservation,
                 matchedFeatures = result.matchedFeatures + it.matchedFeatures,
                 shopReceiptOcr = it.shopReceiptOcr)
-        }) { resolveItems(bitmap, result) }
+        }, invalidateStock = ::clearStockTitles) { resolveItems(bitmap, result, frame, purchasedSlots) }
         // 回执没认出来时同样要把六行读数带进调试状态。
         return if (resolved.shopReceiptOcr != null) resolved
             else resolved.copy(shopReceiptOcr = receiptResolver.diagnostics())
     }
 
-    private fun resolveItems(bitmap: Bitmap, result: LabyrinthEntryFrameResult): LabyrinthEntryFrameResult {
+    private fun resolveItems(bitmap: Bitmap, result: LabyrinthEntryFrameResult, frame: AndroidFrameRoiFingerprints,
+        purchasedSlots: Set<String>): LabyrinthEntryFrameResult {
+        val scope = "$stockEpoch:${bitmap.width}x${bitmap.height}"
+        confirmationOcr.bind(scope, result.observation.state.name)
+        genericDialogOcr.bind(scope, result.observation.state.name)
+        ocr.bind(scope, "stock-A")
+        if (labyrinthShopGenericDialogVisible(result)) {
+            clearStockTitles()
+            confirmationOcr.clear()
+            val rect = ReferenceFitMapper.map(bitmap.width, bitmap.height, STANDARD_REFERENCE,
+                LABYRINTH_SHOP_GENERIC_TITLE_RECT)
+            val read = rect?.let { genericDialogOcr.read(bitmap, frame, "shop-generic-dialog-title", it, 2, whiteText = true, priority = 1) }
+                ?.let { LabyrinthShopReceiptRead(it.text, it.id, it.confirmations) }
+            return resolveShoppingGenericDialog(result, read)
+        }
+        genericDialogOcr.clear()
+        if (result.observation.state == LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION &&
+            result.shopObservation?.dialogState == LabyrinthShopDialogState.PURCHASE_CONFIRMATION) {
+            clearStockTitles()
+            val rect = ReferenceFitMapper.map(bitmap.width, bitmap.height, STANDARD_REFERENCE,
+                LABYRINTH_SHOP_CONFIRMATION_TITLE_RECT) ?: return result
+            val read = confirmationOcr.read(bitmap, frame, "purchase-confirmation-title", rect, 2, darkText = true, priority = 1)
+                ?.let { LabyrinthShopReceiptRead(it.text, it.id, it.confirmations) }
+            return result.copy(shopObservation = result.shopObservation.copy(confirmationTitle = read))
+        }
+        confirmationOcr.clear()
         if (result.observation.state != LabyrinthEntryPageState.SHOP) {
-            ocr.clear()
-            categories.clear()
-            accepted.clear()
+            clearStockTitles()
             return result
         }
         val shop = result.shopObservation ?: return result
+        if (result.nodeMoveConfirmation != null ||
+            shop.viewport != LabyrinthShopViewport.A && purchasedSlots.isEmpty()) {
+            clearStockTitles()
+            return result
+        }
+        if (titleViewport != shop.viewport) clearStockTitles()
+        titleViewport = shop.viewport
         val items = shop.items.map { item ->
-            val referenceRect = TITLE_RECTS[item.slotId] ?: return@map item
+            if (item.slotId in shop.emptySlotIds || item.slotId in purchasedSlots) return@map item
+            val index = LabyrinthShopSlots.keys.indexOf(item.slotId)
+            if (index < 0) return@map item
+            val referenceRect = EntryReferenceRect(listOf(125, 703, 1278)[index % 3],
+                230 + index / 3 * 380 - shop.contentOffset, 390, 55)
+            if (referenceRect.y < 202 || referenceRect.y + referenceRect.height > 875) return@map item
             val titleRect = ReferenceFitMapper.map(bitmap.width, bitmap.height, STANDARD_REFERENCE, referenceRect)
                 ?: return@map item
-            val fingerprint = relicRoiFingerprint(bitmap, titleRect)
-            accepted[item.slotId]?.takeIf { it.first == fingerprint }?.let { (_, read) ->
-                return@map categories.resolve(item, read.text, read.id, 0)
+            val fingerprint = frame.fingerprint(bitmap, titleRect)
+            accepted[item.slotId]?.takeIf { it.fingerprint == fingerprint && it.rect == titleRect }?.let { cached ->
+                return@map categories.resolve(item, cached.read.text, cached.read.id, 0)
             }
             accepted.remove(item.slotId)
             val now = android.os.SystemClock.elapsedRealtime()
@@ -73,11 +146,11 @@ internal class AndroidLabyrinthShopItemResolver(
                 top = maxOf(0, titleRect.top - 3),
                 height = minOf(bitmap.height - maxOf(0, titleRect.top - 3), titleRect.height + 6),
             ) else titleRect
-            val read = ocr.read(bitmap, "shop-title-${item.slotId}-$variant", rect,
+            val read = ocr.read(bitmap, frame, "shop-title-$stockEpoch-${item.slotId}-$variant", rect,
                 scale = if (variant == 0) 2 else 3)
             val resolved = categories.resolve(item, read?.text, read?.id, attempt)
             if (resolved.categoryState == LabyrinthShopCategoryState.READY && read != null) {
-                accepted[item.slotId] = fingerprint to read
+                accepted[item.slotId] = AcceptedTitle(titleRect, fingerprint, read)
             } else {
                 // Retire this crop variant only once its OCR actually completed (read != null),
                 // not on a fixed interval: the reads share one serial queue and a time clock was
@@ -118,10 +191,5 @@ internal class AndroidLabyrinthShopItemResolver(
 
     private companion object {
         val STANDARD_REFERENCE = EntryReferenceSize(1920, 1080)
-        val TITLE_RECTS = mapOf(
-            "shop_item_1" to EntryReferenceRect(125, 230, 390, 55),
-            "shop_item_2" to EntryReferenceRect(703, 230, 390, 55),
-            "shop_item_3" to EntryReferenceRect(1278, 230, 390, 55),
-        )
     }
 }

@@ -80,6 +80,42 @@ data class LabyrinthRelicChoiceDecision(
 class LabyrinthRelicChoicePolicy(
     private val config: LabyrinthRelicChoicePolicyConfig = LabyrinthRelicChoicePolicyConfig(),
 ) {
+    /** Explicit marks precede unconfigured marks, which retain the built-in stage-aware heuristic. */
+    fun attributePriorityGroups(
+        stacks: Map<LabyrinthRelicMark, Int>, currentArea: Int? = null, lockedFocus: LabyrinthRelicMark? = null,
+    ): List<List<LabyrinthRelicMark>> {
+        val normalized = LabyrinthRelicMark.entries.associateWith { stacks.getOrDefault(it, 0) }
+        val (focus, pivot) = resolveFocus(normalized, lockedFocus)
+        val early = currentArea != null && currentArea in 1..config.baselineLastArea
+        val remaining = LabyrinthRelicMark.entries.filterNot { it in config.markPriority }
+            .groupBy { mark -> candidateScore(mark, 1, normalized, early, focus, pivot) }
+            .toSortedMap(compareByDescending { it }).values.map { it.toList() }
+        return config.markPriority.map { listOf(it) } + remaining
+    }
+
+    private fun resolveFocus(stacks: Map<LabyrinthRelicMark, Int>, lockedFocus: LabyrinthRelicMark?): Pair<LabyrinthRelicMark, Boolean> {
+        val unfinished = LabyrinthRelicMark.entries.filter { stacks.getValue(it) < config.capstoneTarget }
+        val highest = unfinished.maxByOrNull { stacks.getValue(it) }
+        val debuff = LabyrinthRelicMark.DEBUFF
+        val pivot = stacks.getValue(debuff) >= config.debuffPivotMinimum &&
+            (highest == null || stacks.getValue(debuff) + config.debuffPivotTolerance >= stacks.getValue(highest))
+        val retained = lockedFocus?.takeIf { stacks.getValue(it) < config.capstoneTarget }
+        return (if (pivot) debuff else retained ?: config.markPriority.firstOrNull { it in unfinished } ?: highest ?: debuff) to pivot
+    }
+
+    private fun candidateScore(mark: LabyrinthRelicMark, bonus: Int, stacks: Map<LabyrinthRelicMark, Int>,
+        early: Boolean, focus: LabyrinthRelicMark, pivot: Boolean): Double {
+        val before = stacks.getValue(mark)
+        val useful = minOf(bonus, (config.capstoneTarget - before).coerceAtLeast(0))
+        val deficit = if (mark in BASELINE_MARKS) (config.baselineTarget - before).coerceAtLeast(0) else 0
+        return useful * 2.0 + minOf(bonus, deficit) * (if (early) 2.5 else 0.25) +
+            (if (deficit > 0 && bonus >= deficit) if (early) 4.0 else 2.0 else 0.0) +
+            (if (useful > 0) before.coerceAtMost(config.capstoneTarget) * 0.5 else 0.0) +
+            (if (mark == focus && useful > 0) 3.0 else 0.0) +
+            (if (mark == LabyrinthRelicMark.DEBUFF && pivot && useful > 0) 1.0 else 0.0) +
+            (if (useful > 0) config.priorityBonus(mark) else 0.0)
+    }
+
     fun choose(
         acquired: List<LabyrinthObservedRelic>,
         candidates: List<LabyrinthRelicMatch>,
@@ -96,29 +132,11 @@ class LabyrinthRelicChoicePolicy(
         }
         if (recognized.isEmpty()) return null
 
-        val baselineMarks = listOf(
-            LabyrinthRelicMark.ACCELERATION,
-            LabyrinthRelicMark.CRITICAL,
-            LabyrinthRelicMark.DEFENSE,
-        )
-        val deficits = baselineMarks.associateWith { mark ->
+        val deficits = BASELINE_MARKS.associateWith { mark ->
             (config.baselineTarget - stacks.getValue(mark)).coerceAtLeast(0)
         }
-        val unfinished = LabyrinthRelicMark.entries.filter { stacks.getValue(it) < config.capstoneTarget }
-        val highestUnfinished = unfinished.maxByOrNull { stacks.getValue(it) }
         val debuff = LabyrinthRelicMark.DEBUFF
-        val debuffCanPivot = stacks.getValue(debuff) >= config.debuffPivotMinimum &&
-            (highestUnfinished == null ||
-                stacks.getValue(debuff) + config.debuffPivotTolerance >= stacks.getValue(highestUnfinished))
-        val retainedFocus = lockedFocus?.takeIf { stacks.getValue(it) < config.capstoneTarget }
-        // With a user order, the highest-ranked unfinished mark is what the run chases; without
-        // one, the existing "whichever stack is already tallest" rule stands.
-        val preferredUnfinished = config.markPriority.firstOrNull { it in unfinished }
-        val focus = if (debuffCanPivot) {
-            debuff
-        } else {
-            retainedFocus ?: preferredUnfinished ?: highestUnfinished ?: debuff
-        }
+        val (focus, debuffCanPivot) = resolveFocus(stacks, lockedFocus)
 
         val immediateCapstone = recognized
             .filter { candidate ->
@@ -132,20 +150,8 @@ class LabyrinthRelicChoicePolicy(
             )
         // Unknown area must not keep a late-run takeover trapped in the early baseline policy.
         val early = currentArea != null && currentArea in 1..config.baselineLastArea
-        fun score(candidate: Candidate): Double {
-            val before = stacks.getValue(candidate.mark)
-            val useful = minOf(candidate.bonus, (config.capstoneTarget - before).coerceAtLeast(0))
-            val deficit = deficits.getOrDefault(candidate.mark, 0)
-            val fillsBaseline = minOf(candidate.bonus, deficit)
-            val finishesBaseline = deficit > 0 && candidate.bonus >= deficit
-            return useful * 2.0 +
-                fillsBaseline * (if (early) 2.5 else 0.25) +
-                (if (finishesBaseline) if (early) 4.0 else 2.0 else 0.0) +
-                (if (useful > 0) before.coerceAtMost(config.capstoneTarget) * 0.5 else 0.0) +
-                (if (candidate.mark == focus && useful > 0) 3.0 else 0.0) +
-                (if (candidate.mark == debuff && debuffCanPivot && useful > 0) 1.0 else 0.0) +
-                (if (useful > 0) config.priorityBonus(candidate.mark) else 0.0)
-        }
+        fun score(candidate: Candidate): Double =
+            candidateScore(candidate.mark, candidate.bonus, stacks, early, focus, debuffCanPivot)
         val choice = immediateCapstone ?: recognized.maxWithOrNull(
             compareBy<Candidate> { score(it) }.thenBy { it.bonus },
         ) ?: return null
@@ -191,6 +197,10 @@ class LabyrinthRelicChoicePolicy(
             if (stacks >= 0) totals[mark] = stacks
         }
         return totals
+    }
+
+    private companion object {
+        val BASELINE_MARKS = setOf(LabyrinthRelicMark.ACCELERATION, LabyrinthRelicMark.CRITICAL, LabyrinthRelicMark.DEFENSE)
     }
 
     private data class Candidate(

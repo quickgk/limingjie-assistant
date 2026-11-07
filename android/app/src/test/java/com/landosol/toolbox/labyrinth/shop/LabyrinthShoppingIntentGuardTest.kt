@@ -80,13 +80,9 @@ class LabyrinthShoppingIntentGuardTest {
         assertTrue(LabyrinthShoppingIntentGuard.movedAway(noFloor, nodeId = 8L, floor = 9))
     }
 
-    /**
-     * 兜底作废必须晚于「连续 hold 满 180 秒停止整局」。
-     *
-     * 反过来会让作废抢在保守停止前面，等于悄悄废掉那条 fail-closed 契约。
-     */
+    /** 意图年龄兜底晚于单段 hold 的放弃期限；页面过渡不能无限延长等待。 */
     @Test
-    fun `作废期限晚于购物 hold 停止期限`() {
+    fun `意图年龄兜底晚于购物hold放弃期限`() {
         assertTrue(
             "ABANDON_MILLIS=${LabyrinthShoppingIntentGuard.ABANDON_MILLIS} 必须大于 " +
                 "SHOPPING_HOLD_TIMEOUT_MILLIS=$SHOPPING_HOLD_TIMEOUT_MILLIS",

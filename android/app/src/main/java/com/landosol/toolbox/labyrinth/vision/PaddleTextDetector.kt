@@ -41,7 +41,7 @@ internal data class PaddleOcrLine(
  * - 后处理 `DBPostProcessor::BoxesFromBitmap` + `FilterTagDetRes`，几何部分见 [PaddleDbGeometry]
  * - 裁图 `get_rotate_crop_image`（四点透视，高宽比 ≥1.5 转 90°）
  *
- * 与官方的已知差异（显式取舍，不藏在代码里）：
+ * 与官方的已知差异：
  * 1. `cv::findContours` 用连通域 + 边界像素近似，只取外轮廓，不返回孔洞轮廓；
  * 2. `UnClip` 用矩形外扩替代 ClipperLib 多边形外扩（对矩形等价，官方先取整带来 1 px 内差异）；
  * 3. `BoxScoreFast` 用像素中心偶奇判定替代 `cv::fillPoly` 光栅化。

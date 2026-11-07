@@ -10,97 +10,105 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LabyrinthShopOcrReadStateTest {
-    private val confirm = EntryPixelRect(780, 710, 360, 65)
-
-    @Test fun `价格等待真正第二次回调且缓存读取不增加计数`() {
+    @Test fun `fast receipt route invalidates stock even without ordinary item resolution and late OCR stays stale`() {
         var now = 0L
-        val state = LabyrinthShopPriceReadState { now }
-        val first = requireNotNull(state.request(11))
-        assertNull(state.request(11))
-        assertTrue(state.reads.isEmpty())
-        state.complete(first, prices())
-        repeat(20) { assertEquals(1, state.reads["wallet"]?.confirmations) }
-        state.complete(first, prices())
-        assertEquals(1, state.reads["wallet"]?.confirmations)
-        assertNull(state.request(11))
-        now = 300
-        val second = requireNotNull(state.request(11))
-        assertNotEquals(first.evidenceId, second.evidenceId)
-        assertEquals(1, state.reads["wallet"]?.confirmations)
-        state.complete(second, prices())
-        state.reads.values.forEach { assertEquals(2, it.confirmations) }
-        now = 600
-        assertNull(state.request(11))
-        assertNull(state.reviewReason)
+        val scheduler = RelicOcrScheduler({ now }, maximumAttempts = 1)
+        val categories = LabyrinthShopCategoryResolution()
+        val accepted = mutableMapOf("shop_item_1" to "old")
+        val ticket = requireNotNull(scheduler.request("shop-title-1-shop_item_1-0", 42))
+        categories.attempt("shop_item_1", 42, now)
+        categories.noteVariantOutcome("shop_item_1", 42, 0, true, now, now)
+        assertEquals(1, categories.attempt("shop_item_1", 42, now))
+        val receiptFrame = LabyrinthEntryFrameResult(
+            observation = LabyrinthEntryPageObservation(LabyrinthEntryPageState.SHOP_PURCHASE_COMPLETE, 1.0,
+                emptyMap(), LabyrinthAnchorScores(emptyMap())), matchedFeatures = emptyList(), elapsedMillis = 0)
+        assertSame(receiptFrame, resolveShopReceiptOrPage(receiptFrame, invalidateStock = {
+            scheduler.clear(); categories.clear(); accepted.clear()
+        }) { error("fast receipt must not resolve ordinary stock") })
+        now = 500
+        scheduler.complete(ticket, "old")
+        assertNull(scheduler.cached("shop-title-2-shop_item_1-0", 42))
+        assertTrue(accepted.isEmpty())
+        assertEquals(0, categories.attempt("shop_item_1", 42, now))
+        val current = requireNotNull(scheduler.request("shop-title-2-shop_item_1-0", 42))
+        scheduler.complete(current, "new")
+        assertEquals("new", scheduler.cached("shop-title-2-shop_item_1-0", 42)?.text)
     }
 
-    @Test fun `价格OCR漂移只重置漂移字段且允许第三次独立复核`() {
-        var now = 0L
-        val state = LabyrinthShopPriceReadState { now }
-        state.complete(requireNotNull(state.request(11)), prices())
-        now = 300
-        state.complete(requireNotNull(state.request(11)), prices("101"))
-        assertEquals(1, state.reads["shop_item_1"]?.confirmations)
-        assertEquals(2, state.reads["shop_item_2"]?.confirmations)
-        now = 600
-        state.complete(requireNotNull(state.request(11)), prices("101"))
-        assertEquals(2, state.reads["shop_item_1"]?.confirmations)
-        assertEquals("101", state.reads["shop_item_1"]?.text)
+    @Test fun `确认钱包来源必须对应当前页面且通用弹窗不能作为地图钱包`() {
+        fun frame(page: LabyrinthEntryPageState, dialog: LabyrinthShopDialogState = LabyrinthShopDialogState.NONE,
+            scores: Map<String, Double> = emptyMap()) = LabyrinthEntryFrameResult(
+            observation = LabyrinthEntryPageObservation(page, 1.0, emptyMap(), LabyrinthAnchorScores(scores)),
+            matchedFeatures = emptyList(), elapsedMillis = 0,
+            shopObservation = LabyrinthShopObservation(emptyList(), dialog))
+        val purchase = frame(LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION, LabyrinthShopDialogState.PURCHASE_CONFIRMATION)
+        assertEquals(LabyrinthCurrencySource.PURCHASE_CONFIRMATION, labyrinthCurrencyReadSource(purchase))
+        assertEquals(LabyrinthCurrencySource.PURCHASE_CONFIRMATION, labyrinthCurrencyReadSource(purchase.copy(
+            nodeMoveConfirmation = LabyrinthNodeMoveConfirmationObservation(1.0, confirm, confirm))))
+        assertNull(labyrinthCurrencyReadSource(frame(LabyrinthEntryPageState.SHOP_PURCHASE_CONFIRMATION)))
+        val modal = frame(LabyrinthEntryPageState.UNKNOWN, scores = mapOf(EntryAnchorId.SHOP_TITLE to 1.0)).copy(
+            nodeMoveConfirmation = LabyrinthNodeMoveConfirmationObservation(1.0, confirm, confirm),
+            shopObservation = LabyrinthShopObservation(emptyList(), refreshConfirmationTitle = LabyrinthShopReceiptRead("更新确认", 2, 2)))
+        assertEquals(LabyrinthCurrencySource.REFRESH_CONFIRMATION, labyrinthCurrencyReadSource(modal))
+        assertNull(labyrinthCurrencyReadSource(modal.copy(shopObservation = modal.shopObservation!!.copy(
+            refreshConfirmationTitle = LabyrinthShopReceiptRead("更新确认", 1, 1)))))
+        assertNull(labyrinthCurrencyReadSource(modal.copy(observation = modal.observation.copy(
+            state = LabyrinthEntryPageState.NODE_SELECTION))))
+        assertNull(labyrinthCurrencyReadSource(modal.copy(observation = modal.observation.copy(
+            state = LabyrinthEntryPageState.SHOP_EXIT_CONFIRMATION))))
+        assertNull(labyrinthCurrencyReadSource(modal.copy(observation = modal.observation.copy(
+            anchorScores = LabyrinthAnchorScores(emptyMap())))))
+        assertEquals(LabyrinthCurrencySource.WALLET, labyrinthCurrencyReadSource(frame(LabyrinthEntryPageState.SHOP)))
     }
 
-    @Test fun `价格旧epoch结果丢弃且旧请求未完成时不能积累作业`() {
-        var now = 0L
-        val state = LabyrinthShopPriceReadState { now }
-        val old = requireNotNull(state.request(11))
-        now = 300
-        assertNull(state.request(22))
-        assertTrue(state.reads.isEmpty())
-        state.complete(old, prices())
-        assertTrue(state.reads.isEmpty())
-        val current = requireNotNull(state.request(22))
-        state.complete(old, prices())
-        assertNull(state.request(22))
-        state.complete(current, prices("200"))
-        assertEquals("200", state.reads["shop_item_1"]?.text)
-        assertEquals(1, state.reads["shop_item_1"]?.confirmations)
-        state.clear()
-        val next = requireNotNull(state.request(22))
-        state.clear()
-        assertNull(state.request(22))
-        state.complete(next, prices())
-        assertTrue(state.reads.isEmpty())
-        assertNotNull(state.request(22))
-    }
-
-    @Test fun `价格失效指纹即使回到旧图也不能接受旧epoch回调`() {
-        val state = LabyrinthShopPriceReadState { 0 }
-        val first = requireNotNull(state.request(11))
-        state.request(22)
-        state.request(11)
-        state.complete(first, prices())
-        assertTrue(state.reads.isEmpty())
-        assertNotNull(state.request(11))
-    }
-
-    @Test fun `无效金额不会凭两次相同空结果复核且六次后自动重读`() {
-        var now = 0L
-        val state = LabyrinthShopPriceReadState { now }
-        repeat(6) { index ->
-            val ticket = requireNotNull(state.request(11))
-            state.complete(ticket, prices("1O0"))
-            assertEquals(1, state.reads["shop_item_1"]?.confirmations)
-            if (index < 5) now += 300
+    @Test fun `通用蓝底相似不能确认退出且当前更新标题双读才纠正分类`() {
+        val original = LabyrinthEntryFrameResult(
+            observation = LabyrinthEntryPageObservation(LabyrinthEntryPageState.SHOP_EXIT_CONFIRMATION, 0.734,
+                emptyMap(), LabyrinthAnchorScores(mapOf(EntryAnchorId.SHOP_TITLE to 0.99,
+                    EntryAnchorId.SHOP_EXIT_CONFIRMATION_TITLE to 0.734))),
+            matchedFeatures = emptyList(), elapsedMillis = 0,
+            nodeMoveConfirmation = LabyrinthNodeMoveConfirmationObservation(1.0, confirm, confirm),
+            shopObservation = LabyrinthShopObservation(emptyList(), LabyrinthShopDialogState.EXIT_CONFIRMATION))
+        for (read in listOf(null, LabyrinthShopReceiptRead(null, 2, 2), LabyrinthShopReceiptRead("更新确认", 1, 1),
+            LabyrinthShopReceiptRead("更新确认?", 2, 2), LabyrinthShopReceiptRead("商店确认", 2, 2))) {
+            val resolved = resolveShoppingGenericDialog(original, read)
+            assertFalse(labyrinthShopRefreshDialogVisible(resolved))
+            assertNull(labyrinthCurrencyReadSource(resolved))
+            assertEquals(read?.text == "商店确认", labyrinthShopExitDialogConfirmed(resolved))
         }
-        assertNotNull(state.reviewReason)
-        now += 2_999
-        assertNull(state.request(11))
-        now++
-        val recovered = requireNotNull(state.request(11))
-        assertTrue(state.reads.isEmpty())
-        assertNull(state.reviewReason)
-        state.complete(recovered, prices())
-        assertEquals(1, state.reads["shop_item_1"]?.confirmations)
+        val correct = resolveShoppingGenericDialog(original, LabyrinthShopReceiptRead("更 新确认", 2, 2))
+        assertEquals(LabyrinthEntryPageState.UNKNOWN, correct.observation.state)
+        assertTrue(labyrinthShopRefreshDialogVisible(correct))
+        assertFalse(labyrinthShopExitDialogConfirmed(correct))
+        assertEquals(LabyrinthCurrencySource.REFRESH_CONFIRMATION, labyrinthCurrencyReadSource(correct))
+        assertFalse(labyrinthShopRefreshDialogVisible(correct.copy(nodeMoveConfirmation = null)))
+        assertFalse(labyrinthShopRefreshDialogVisible(correct.copy(observation = correct.observation.copy(
+            state = LabyrinthEntryPageState.NODE_SELECTION))))
+        var now = 0L
+        val scheduler = RelicOcrScheduler({ now })
+        val first = requireNotNull(scheduler.request("generic", 11))
+        scheduler.complete(first, "更新确认")
+        now = 400
+        val old = requireNotNull(scheduler.request("generic", 11))
+        scheduler.clear()
+        scheduler.complete(old, "更新确认")
+        assertNull(scheduler.cached("generic", 12))
     }
+
+    @Test fun `读取确认钱包不会把单读或重复getter变成双读`() {
+        val single = LabyrinthCurrencyObservation(LabyrinthShopReceiptRead("5,800", 41, 1),
+            LabyrinthCurrencySource.PURCHASE_CONFIRMATION)
+        repeat(20) { assertNull(single.balance); assertEquals(1, single.read!!.confirmations) }
+        val verified = single.copy(read = LabyrinthShopReceiptRead("5,800", 42, 2))
+        assertEquals(5800L, verified.balance)
+        assertNull(verified.copy(read = verified.read!!.copy(text = null)).balance)
+        assertEquals(false, LabyrinthShopItemText.confirmedImprintChoice("攻击型职能的随机印记"))
+        assertEquals(true, LabyrinthShopItemText.confirmedImprintChoice("攻击型职能的选择印记"))
+        assertNull(LabyrinthShopItemText.confirmedImprintChoice("攻击型职能印记"))
+        assertNull(LabyrinthShopItemText.confirmedImprintChoice("选择随机印记"))
+    }
+
+    private val confirm = EntryPixelRect(780, 710, 360, 65)
 
     @Test fun `回执只有事实一致的第二次实际回调才能通过`() {
         var now = 0L
@@ -421,10 +429,6 @@ class LabyrinthShopOcrReadStateTest {
             assertEquals(0.0, result.observation.confidence, 0.0)
             assertSame(result, resolveShopReceiptOrPage(result) { error("未核实回执不得绕过校验") })
         }
-    }
-
-    private fun prices(first: String = "100") = listOf(first, "200", "300", "10", "1000").mapIndexed { index, text ->
-        LabyrinthShopOcrLine(text, EntryPixelRect(index % 3 * 500 + 25, index / 3 * 180 + 25, 200, 40))
     }
 
     private fun receiptRow(index: Int, left: Int = 20) =

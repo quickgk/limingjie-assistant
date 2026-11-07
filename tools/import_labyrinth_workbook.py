@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sqlite3
 import xml.etree.ElementTree as ET
+from contextlib import closing
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -33,6 +35,9 @@ INCLUDED_SHEETS = (
     "后续更新",
 )
 EXCLUDED_SHEETS = ("EXTREME", "BOSS", "攻略", "EX首饰")
+# Mainland-CN display names override workbook translations without editing the workbook.
+RELIC_NAME_OVERRIDES = {"50005": "拉比林斯之主"}
+NON_SHOP_SUMMON_PRICE = 99_999_999
 
 
 def column_number(address: str) -> int:
@@ -141,7 +146,7 @@ def relics_from_workbook(document: dict[str, object]) -> dict[str, object]:
         records.append(
             {
                 "id": str(cells[1]),
-                "name": str(cells[3]),
+                "name": RELIC_NAME_OVERRIDES.get(str(cells[1]), str(cells[3])),
                 "tags": [mark] if mark else [],
                 "rarity": str(cells.get(4, "")),
                 "effect": str(cells.get(5, "")),
@@ -157,19 +162,58 @@ def relics_from_workbook(document: dict[str, object]) -> dict[str, object]:
     return {"schemaVersion": 1, "relics": records}
 
 
+def summon_units_from_database(source: Path) -> dict[str, object]:
+    """Import sale prices by named columns; unrelated hashed columns are never consumed."""
+    records: list[dict[str, object]] = []
+    uri = source.resolve().as_uri() + "?mode=ro&immutable=1"
+    with closing(sqlite3.connect(uri, uri=True)) as database:
+        rows = database.execute(
+            "SELECT item_id, name, summon_type, summon_num, price, description "
+            "FROM labyrinth_summon_unit WHERE price > 0 AND price < ? ORDER BY item_id",
+            (NON_SHOP_SUMMON_PRICE,),
+        )
+        for item_id, name, summon_type, summon_num, price, description in rows:
+            if item_id <= 0 or not name.strip() or summon_type not in (1, 3) or summon_num != 1:
+                raise ValueError(f"Invalid shop summon item: {item_id}")
+            records.append({
+                "id": str(item_id), "name": name, "summonType": summon_type,
+                "summonNum": summon_num, "price": price, "description": description,
+            })
+    if not records:
+        raise ValueError("No shop-listed summon items found")
+    return {"schemaVersion": 1, "summonUnits": records}
+
+
+def write_json(path: Path, document: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source", type=Path)
-    parser.add_argument("workbook_output", type=Path)
-    parser.add_argument("relics_output", type=Path)
+    parser.add_argument("source", type=Path, nargs="?")
+    parser.add_argument("workbook_output", type=Path, nargs="?")
+    parser.add_argument("relics_output", type=Path, nargs="?")
+    parser.add_argument("--summon-database", type=Path, help="Read-only mainland-CN master database")
+    parser.add_argument("--summon-output", type=Path, help="Shop-listed summon resource JSON")
     args = parser.parse_args()
-    document = build_workbook_document(args.source)
-    relics = relics_from_workbook(document)
-    args.workbook_output.parent.mkdir(parents=True, exist_ok=True)
-    args.relics_output.parent.mkdir(parents=True, exist_ok=True)
-    args.workbook_output.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    args.relics_output.write_text(json.dumps(relics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"wrote {len(document['tables'])} tables and {len(relics['relics'])} relics")
+    workbook_args = (args.source, args.workbook_output, args.relics_output)
+    if any(workbook_args) and not all(workbook_args):
+        parser.error("source, workbook_output and relics_output must be supplied together")
+    if bool(args.summon_database) != bool(args.summon_output):
+        parser.error("--summon-database and --summon-output must be supplied together")
+    if not args.source and not args.summon_database:
+        parser.error("provide a workbook or a summon database")
+    if args.source:
+        document = build_workbook_document(args.source)
+        relics = relics_from_workbook(document)
+        write_json(args.workbook_output, document)
+        write_json(args.relics_output, relics)
+        print(f"wrote {len(document['tables'])} tables and {len(relics['relics'])} relics")
+    if args.summon_database:
+        summons = summon_units_from_database(args.summon_database)
+        write_json(args.summon_output, summons)
+        print(f"wrote {len(summons['summonUnits'])} shop summon items")
 
 
 if __name__ == "__main__":

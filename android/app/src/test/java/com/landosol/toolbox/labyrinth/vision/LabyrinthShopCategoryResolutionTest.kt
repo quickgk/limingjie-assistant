@@ -2,6 +2,7 @@ package com.landosol.toolbox.labyrinth.vision
 
 import com.landosol.toolbox.labyrinth.LabyrinthShopDecision
 import com.landosol.toolbox.labyrinth.LabyrinthShopPolicy
+import com.landosol.toolbox.labyrinth.decideAfterFullScan
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.File
@@ -20,9 +21,11 @@ class LabyrinthShopCategoryResolutionTest {
             .recognize(readImage(File(root, "android/app/src/test/resources/shop/imprints-20260914.jpg")))
         val log = Json.parseToJsonElement(File(root, "android/app/src/test/resources/shop/imprints-20260914.json").readText()).jsonObject
         val titles = log.getValue("items").jsonArray.map { it.jsonObject.getValue("titleText").jsonPrimitive.content }
-        assertEquals(3, raw.items.size)
-        assertTrue(raw.items.all { it.purchasable })
-        val classified = raw.items.mapIndexed { i, item -> resolver.resolve(item, titles[i], i.toLong(), 0) }
+        assertEquals(6, raw.items.size)
+        assertEquals(LabyrinthShopViewport.A, raw.viewport)
+        assertTrue(raw.items.drop(3).all { it.status == LabyrinthShopItemStatus.UNKNOWN })
+        assertTrue(raw.items.take(3).all { it.purchasable })
+        val classified = raw.items.take(3).mapIndexed { i, item -> resolver.resolve(item, titles[i], i.toLong(), 0) }
         assertTrue(classified.all { it.kind == LabyrinthShopItemKind.ROLE_IMPRINT && it.relicMatch == null })
         assertEquals("增益型职能印记", classified[2].roleImprintLabel)
         assertTrue(decide(classified) is LabyrinthShopDecision.BuyRoleImprint)
@@ -47,8 +50,8 @@ class LabyrinthShopCategoryResolutionTest {
             displayName = "候选遗物", attribute = "弱体", attributeBonus = "1", effect = null,
             confidence = 0.715, screenRect = rect, iconRect = rect, rivalMargin = 0.000338),
     )
-    private fun decide(items: List<LabyrinthShopItemMatch>, area: Int = 3, purchased: Int = 0) =
-        LabyrinthShopPolicy().decide(area, items, emptyList(), refreshAvailable = true, relicPurchasesInCycle = purchased)
+    private fun decide(items: List<LabyrinthShopItemMatch>, area: Int = 3, purchased: Int = 0, refreshAvailable: Boolean = false) =
+        LabyrinthShopPolicy().decideAfterFullScan(area, items, emptyList(), refreshAvailable = refreshAvailable, relicPurchasesInCycle = purchased)
 
     @Test fun `title classification overrides even a recognized relic icon`() {
         val result = resolver.resolve(item(recognized = true), "增益型识能的随机印记", 22, 0)
@@ -118,7 +121,7 @@ class LabyrinthShopCategoryResolutionTest {
         val items = listOf("攻击型职能的随机印记", "治疗型职能的随机印记", "增益型识能的随机印记")
             .mapIndexed { i, title -> resolver.resolve(item(i.toString()), title, i.toLong(), 0) }
         assertTrue(decide(items, 3) is LabyrinthShopDecision.BuyRoleImprint)
-        assertTrue(decide(items, 5) is LabyrinthShopDecision.Refresh)
+        assertTrue(decide(items, 5, refreshAvailable = true) is LabyrinthShopDecision.Refresh)
     }
 
     /**
@@ -144,7 +147,7 @@ class LabyrinthShopCategoryResolutionTest {
 
         // Among equals the leftmost slot keeps the pick deterministic.
         val second = resolver.resolve(item("3"), "坦克型职能的随机印记", 3, 0)
-        val tie = decide(listOf(second, random), area = 5) as LabyrinthShopDecision.BuyRoleImprint
+        val tie = decide(listOf(random, second), area = 5) as LabyrinthShopDecision.BuyRoleImprint
         assertEquals("2", tie.item.slotId)
     }
 

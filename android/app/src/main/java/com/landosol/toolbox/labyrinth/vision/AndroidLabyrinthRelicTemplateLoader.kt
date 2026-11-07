@@ -28,6 +28,8 @@ class AndroidLabyrinthRelicTemplateLoader(
                     .ifBlank { SPECIAL_ATTRIBUTE },
                 attributeBonus = relic.markBonus,
                 effect = relic.effect,
+                basePrice = relic.price,
+                rarity = relic.rarity.toIntOrNull(),
                 image = loadImage("$PACK_ROOT/${icon.file}"),
             )
         }

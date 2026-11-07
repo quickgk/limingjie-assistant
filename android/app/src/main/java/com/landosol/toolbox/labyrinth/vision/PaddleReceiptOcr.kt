@@ -54,7 +54,7 @@ internal data class PaddleRecLine(val text: String, val score: Float)
 /**
  * 回执字段的主读：PaddleOCR mobile rec，跑在 ONNX Runtime 上。
  *
- * 六块字段各自裁剪后逐块识别，读数直接进判定，同时写进调试状态。任何失败都返回 null，
+ * 必需字段各自裁剪后逐块识别，读数直接进判定，同时写进调试状态。任何失败都返回 null，
  * 该帧按未读出处理。模型与字典随 assets 分发，首次使用时解到 filesDir；用 v4 还是 v5 由
  * assets 里实际存在的文件决定，见 [PaddleRecVariant] 与 [resolveRecVariant]。
  */
@@ -82,20 +82,32 @@ internal class PaddleReceiptOcr(context: Context) {
     fun recognize(bitmap: Bitmap): String? = recognizeLine(bitmap)?.text
 
     /** 同 [recognize]，但带置信度；整屏 det 链路需要它来过滤低质量行。 */
-    fun recognizeLine(bitmap: Bitmap): PaddleRecLine? {
+    fun recognizeLine(bitmap: Bitmap): PaddleRecLine? = runCatching { recognizeLineOrThrow(bitmap) }
+        .onFailure { Log.w(TAG, "recognize failed", it) }.getOrNull()
+
+    /** A returned line always follows real inference; engine and preprocessing failures remain failures. */
+    fun recognizeLineOrThrow(bitmap: Bitmap): PaddleRecLine {
+        val waiting = System.nanoTime()
         val current = synchronized(lock) {
-            if (unavailable) return null
-            engine ?: runCatching { Engine.open(appContext, variant) }
-                .onFailure {
-                    unavailable = true
-                    Log.w(TAG, "model unavailable", it)
+            ShopPerformance.event("ocr.model_lock", waiting)
+            check(!unavailable) { "Paddle model unavailable" }
+            if (engine != null) ShopPerformance.event("ocr.model_warm")
+            engine ?: try {
+                Engine.open(appContext, variant).also {
+                    engine = it
+                    ShopPerformance.event("ocr.model_cold", waiting)
                 }
-                .getOrNull()
-                ?.also { engine = it }
-        } ?: return null
-        return runCatching { current.recognize(bitmap) }
-            .onFailure { Log.w(TAG, "recognize failed", it) }
-            .getOrNull()
+            } catch (failure: Exception) {
+                unavailable = true
+                Log.w(TAG, "model unavailable", failure)
+                throw failure
+            }
+        }
+        val modelWaiting = System.nanoTime()
+        return synchronized(lock) {
+            ShopPerformance.event("ocr.model_ready", modelWaiting)
+            current.recognize(bitmap)
+        }
     }
 
     private class Engine(
@@ -105,6 +117,7 @@ internal class PaddleReceiptOcr(context: Context) {
         private val inputName: String,
     ) {
         fun recognize(bitmap: Bitmap): PaddleRecLine {
+            val preprocessingStarted = System.nanoTime()
             val prepared = tighten(bitmap)
             val targetHeight = INPUT_HEIGHT
             val targetWidth = ((prepared.width.toFloat() / prepared.height) * targetHeight)
@@ -130,7 +143,11 @@ internal class PaddleReceiptOcr(context: Context) {
             var scoreSum = 0f
             var scoreCount = 0
             try {
+                ShopPerformance.event("ocr.preprocess", preprocessingStarted)
+                val inferenceStarted = System.nanoTime()
                 session.run(mapOf(inputName to tensor)).use { output ->
+                    ShopPerformance.event("ocr.inference", inferenceStarted)
+                    val decodeStarted = System.nanoTime()
                     val steps = (output[0].value as Array<*>)[0] as Array<FloatArray>
                     var previous = -1
                     for (step in steps) {
@@ -146,9 +163,12 @@ internal class PaddleReceiptOcr(context: Context) {
                         }
                         previous = best
                     }
+                    ShopPerformance.event("ocr.decode", decodeStarted)
                 }
             } finally {
                 tensor.close()
+                if (scaled !== prepared && scaled !== bitmap && !scaled.isRecycled) scaled.recycle()
+                if (prepared !== bitmap && !prepared.isRecycled) prepared.recycle()
             }
             return PaddleRecLine(builder.toString(), if (scoreCount == 0) 0f else scoreSum / scoreCount)
         }
@@ -181,6 +201,7 @@ internal class PaddleReceiptOcr(context: Context) {
             canvas.drawColor(Color.WHITE)
             val trimmed = Bitmap.createBitmap(bitmap, ink.left, ink.top, ink.width(), ink.height())
             canvas.drawBitmap(trimmed, PAD.toFloat(), PAD.toFloat(), null)
+            if (trimmed !== bitmap && !trimmed.isRecycled) trimmed.recycle()
             return padded
         }
 

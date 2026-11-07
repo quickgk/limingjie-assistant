@@ -4,7 +4,6 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.file.Files
-import java.security.MessageDigest
 import kotlinx.serialization.json.*
 import org.junit.Assert.*
 import org.junit.Rule
@@ -17,17 +16,16 @@ class LabyrinthShoppingJournalTest {
     private val store by lazy { LabyrinthShoppingJournal(root) }
     private val run by lazy { store.open(1, 99, "batch-1", 0) }
     private val body = buildJsonObject { put("amount", 12) }
-    private fun append(key: String = "test-1", evidence: String? = null) =
-        store.append(run, key, "test.fact", 3, 1, 0, body, evidence)
-    private fun evidenceEvent(): JsonObject = append(evidence = store.evidence(run, "test-1", ShoppingTestData.encode))
+    private fun append(key: String = "test-1") = store.append(run, key, "test.fact", 3, 1, 0, body)
 
     @Test fun `只保留最近运行且当前运行与静置不足的目录不删除`() {
         val now = System.currentTimeMillis()
         val runs = (1..4).map { store.open(1, 100L + it, null, 0) }
-        // 真实运行都带 evidence/ 子目录与事件日志，删除必须自底向上才删得掉。
+        // 残留子目录也必须自底向上清理。
         runs.forEach { run ->
             val key = "probe-${run.enterId}"
-            store.append(run, key, "test.fact", 1, 1, 0, body, store.evidence(run, key, ShoppingTestData.encode))
+            store.append(run, key, "test.fact", 1, 1, 0, body)
+            File(run.directory, "nested/child.txt").apply { check(parentFile!!.mkdirs()); writeText("retained") }
         }
         runs[0].let { age(it, now - 14_400_000L) }
         runs[1].let { age(it, now - 10_800_000L) }
@@ -41,7 +39,7 @@ class LabyrinthShoppingJournalTest {
         assertTrue(runs[3].directory.exists())
         assertFalse(runs[1].directory.exists())
         assertFalse(runs[2].directory.exists())
-        assertFalse(File(runs[1].directory, "evidence").exists())
+        assertFalse(File(runs[1].directory, "nested").exists())
         assertEquals(1, store.read(runs[3]).size)
 
         val other = LabyrinthShoppingJournal(temp.newFolder("prune"))
@@ -57,14 +55,14 @@ class LabyrinthShoppingJournalTest {
     @Test fun `子项删不掉时保留manifest等下一轮清理`() {
         val now = System.currentTimeMillis()
         val runs = seededRuns(now, baseEnter = 300L)
-        val evidence = File(runs[0].directory, "evidence/probe-${runs[0].enterId}.png")
+        val blockedFile = File(runs[0].directory, "events.jsonl")
         // 注入删除失败，不依赖平台的文件占用语义，CI 上同样能跑。
         val blocked = store.pruneRuns(keep = 1, olderThanMillis = 3_600_000L, now = now,
-            delete = { file -> file != evidence && file.delete() })
+            delete = { file -> file != blockedFile && file.delete() })
         assertEquals(0, blocked.removed)
         assertEquals(listOf(runs[0].directory), blocked.failed)
         assertTrue(File(runs[0].directory, "manifest.json").isFile)
-        assertTrue(evidence.exists())
+        assertTrue(blockedFile.exists())
 
         age(runs[0], now - 7_200_000L)
         assertEquals(1, store.pruneRuns(keep = 1, olderThanMillis = 3_600_000L, now = now).removed)
@@ -106,15 +104,15 @@ class LabyrinthShoppingJournalTest {
         val runs = (1..5).map { journal.open(1, 500L + it, null, 0) }
         val target = runs[0]
         val key = "probe-${target.enterId}"
-        journal.append(target, key, "test.fact", 1, 1, 0, body, journal.evidence(target, key, ShoppingTestData.encode))
-        val evidence = File(target.directory, "evidence/$key.png")
+        journal.append(target, key, "test.fact", 1, 1, 0, body)
+        val blockedFile = File(target.directory, "events.jsonl")
         age(target, now - 7_200_000L)
 
         // 默认 keep=4，目标运行最旧；删除只卡住它的证据文件，目录因此清理失败。
-        val current = journal.open(1, 600L, null, 0, delete = { file -> file != evidence && file.delete() })
+        val current = journal.open(1, 600L, null, 0, delete = { file -> file != blockedFile && file.delete() })
 
         assertEquals(listOf(target.directory), failures)
-        assertTrue(evidence.exists())
+        assertTrue(blockedFile.exists())
         assertEquals(600L, current.enterId)
         assertTrue(current.directory.isDirectory)
     }
@@ -130,13 +128,13 @@ class LabyrinthShoppingJournalTest {
         val runs = (1..5).map { journal.open(1, 700L + it, null, 0) }
         val target = runs[0]
         val key = "probe-${target.enterId}"
-        journal.append(target, key, "test.fact", 1, 1, 0, body, journal.evidence(target, key, ShoppingTestData.encode))
-        val evidence = File(target.directory, "evidence/$key.png")
+        journal.append(target, key, "test.fact", 1, 1, 0, body)
+        val blockedFile = File(target.directory, "events.jsonl")
         age(target, now - 7_200_000L)
 
         val current = journal.open(1, 800L, null, 0, delete = { file ->
-            if (file == evidence) deleteAttempted = true
-            file != evidence && file.delete()
+            if (file == blockedFile) deleteAttempted = true
+            file != blockedFile && file.delete()
         })
 
         assertTrue(deleteAttempted)
@@ -150,7 +148,7 @@ class LabyrinthShoppingJournalTest {
         val runs = (1..2).map { store.open(1, baseEnter + it, null, 0) }
         runs.forEach { run ->
             val key = "probe-${run.enterId}"
-            store.append(run, key, "test.fact", 1, 1, 0, body, store.evidence(run, key, ShoppingTestData.encode))
+            store.append(run, key, "test.fact", 1, 1, 0, body)
         }
         age(runs[0], now - 7_200_000L)
         age(runs[1], now)
@@ -196,74 +194,43 @@ class LabyrinthShoppingJournalTest {
         assertEquals(1, store.read(run).size)
     }
 
-    @Test fun `原图保存原始字节及sha256摘要`() {
-        val event = evidenceEvent(); val path = event["evidence_ref"]!!.jsonPrimitive.content
-        assertArrayEquals(ShoppingTestData.raw, File(run.directory, path).readBytes())
-        val expected = MessageDigest.getInstance("SHA-256").digest(ShoppingTestData.raw).joinToString("") { "%02x".format(it) }
-        assertEquals(expected, event["evidence_sha256"]!!.jsonPrimitive.content)
-        assertTrue(store.evidenceValid(run, event))
+    @Test fun `新事件仅保存可回放日志而不产生旁路文件`() {
+        val event = append()
+        assertEquals(setOf("schema_version", "run_id", "enter_id", "event_id", "seq", "type", "node_id", "floor",
+            "timestamp_utc", "source", "verification_status", "payload"), event.keys)
+        assertEquals(setOf("manifest.json", "events.jsonl"), run.directory.listFiles()!!.map { it.name }.toSet())
+        assertEquals(event, append())
     }
 
-    @Test fun `编码返回false时不保存原图事件或tmp`() {
-        ShoppingTestData.reject { store.evidence(run, "bad", { it.write(byteArrayOf(1)); false }) }
-        assertFalse(File(run.directory, "evidence/bad.png").exists())
-        assertFalse(File(run.directory, "evidence/bad.png.tmp").exists())
-        assertTrue(store.read(run).isEmpty())
+    @Test fun `日志IO失败不产生事件并可恢复追加`() {
+        val before = append()
+        ShoppingTestData.withBlockedAppend(run) { ShoppingTestData.reject { append("test-2") } }
+        assertEquals(listOf(before), store.read(run))
+        assertEquals(2, append("test-2")["seq"]!!.jsonPrimitive.int)
     }
 
-    @Test fun `编码成功但空原图也拒绝`() {
-        ShoppingTestData.reject { store.evidence(run, "empty", { true }) }
-        assertFalse(File(run.directory, "evidence/empty.png").exists())
+    @Test fun `重复编号的作用域来源和状态都必须相同`() {
+        val event = append()
+        ShoppingTestData.reject { store.append(run, "test-1", "test.fact", 4, 1, 0, body) }
+        ShoppingTestData.reject { store.append(run, "test-1", "test.fact", 3, 2, 0, body) }
+        ShoppingTestData.reject { store.append(run, "test-1", "test.fact", 3, 1, 0, body, source = "automation_action") }
+        ShoppingTestData.reject { store.append(run, "test-1", "test.fact", 3, 1, 0, body, verification = "intent_only") }
+        assertEquals(listOf(event), store.read(run))
     }
 
-    @Test fun `编码抛异常清理tmp且之后可以重试`() {
-        try { store.evidence(run, "throws", { throw IOException("模拟编码失败") }); fail("应抛出编码错误") }
-        catch (_: IOException) { }
-        assertFalse(File(run.directory, "evidence/throws.png.tmp").exists())
-        assertEquals("evidence/throws.png", store.evidence(run, "throws", ShoppingTestData.encode))
-    }
-
-    @Test fun `未入账孤立原图不能直接复用而必须重新编码`() {
-        store.evidence(run, "orphan", { it.write(byteArrayOf(9)); true })
-        var called = false
-        store.evidence(run, "orphan", { called = true; it.write(ShoppingTestData.raw); true })
-        assertTrue(called); assertArrayEquals(ShoppingTestData.raw, File(run.directory, "evidence/orphan.png").readBytes())
-    }
-
-    @Test fun `原图重复记录必须复核且篡改后不得用新图修补`() {
-        val event = evidenceEvent()
-        assertEquals("evidence/test-1.png", store.evidence(run, "test-1", ShoppingTestData.neverEncode))
-        val file = File(run.directory, event["evidence_ref"]!!.jsonPrimitive.content)
-        val modified = ShoppingTestData.raw.copyOf().also { it[7] = 99 }; file.writeBytes(modified)
-        assertFalse(store.evidenceValid(run, event))
-        ShoppingTestData.reject { store.evidence(run, "test-1", ShoppingTestData.encode) }
-        ShoppingTestData.reject { append(evidence = "evidence/test-1.png") }
-        assertArrayEquals(modified, file.readBytes())
-    }
-
-    @Test fun `原图删除或变空证据校验失败`() {
-        val event = evidenceEvent(); val file = File(run.directory, event["evidence_ref"]!!.jsonPrimitive.content)
-        file.writeBytes(byteArrayOf()); assertFalse(store.evidenceValid(run, event))
-        assertTrue(file.delete()); assertFalse(store.evidenceValid(run, event))
-    }
-
-    @Test fun `没有实际原图的引用不得入账`() {
-        ShoppingTestData.reject { append(evidence = "evidence/missing.png") }
-        assertTrue(store.read(run).isEmpty())
-    }
-
-    @Test fun `拒绝证据编号路径穿越及伪造run`() {
-        ShoppingTestData.reject { store.evidence(run, "../escape", ShoppingTestData.encode) }
-        ShoppingTestData.reject { append(evidence = "../escape.png") }
+    @Test fun `拒绝事件编号路径穿越及伪造run`() {
+        ShoppingTestData.reject { append("../escape") }
         ShoppingTestData.reject { store.read(run.copy(directory = temp.root)) }
-        assertFalse(store.evidenceValid(run, buildJsonObject {
-            put("run_id", run.runId); put("enter_id", run.enterId); put("evidence_ref", "../escape.png")
-        }))
+        val forged = run.copy(enterId = 100)
+        ShoppingTestData.reject { store.read(forged) }
+        ShoppingTestData.reject { store.append(forged, "bad", "test.fact", 3, 1, 0, body) }
+        assertTrue(store.read(run).isEmpty())
     }
 
-    @Test fun `其他enter原图事件不能在当前run通过复核`() {
-        val event = evidenceEvent()
-        assertFalse(store.evidenceValid(store.open(1, 100, null, 0), event))
+    @Test fun `其他enter完整事件不能混入当前日志`() {
+        append()
+        ShoppingTestData.rewriteEvents(run) { event -> JsonObject(event + ("enter_id" to JsonPrimitive(100))) }
+        ShoppingTestData.reject { store.read(run) }
     }
 
     @Test fun `中断追加末尾先保存再截断且后续序号正常`() {
@@ -308,9 +275,12 @@ class LabyrinthShoppingJournalTest {
         ShoppingTestData.reject { store.read(run) }
     }
 
-    @Test fun `manifest账户损坏拒绝重新open`() {
+    @Test fun `manifest账户损坏拒绝读取追加及重新open`() {
         val current = run; val file = File(current.directory, "manifest.json")
         file.writeText(file.readText().replace("\"account_id\":1", "\"account_id\":2"))
+        ShoppingTestData.reject { store.read(current) }
+        ShoppingTestData.reject { append() }
         ShoppingTestData.reject { store.open(1, 99, null, 1) }
+        assertFalse(File(current.directory, "events.jsonl").exists())
     }
 }

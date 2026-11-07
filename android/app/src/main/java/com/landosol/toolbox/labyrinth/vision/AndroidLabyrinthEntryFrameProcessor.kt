@@ -235,35 +235,55 @@ class AndroidLabyrinthEntryFrameProcessor private constructor(
     private val exEncounterResolver: AndroidLabyrinthExEncounterResolver,
     private val eventChoiceResolver: AndroidLabyrinthEventChoiceResolver?,
     private val shopItemResolver: AndroidLabyrinthShopItemResolver,
+    private val currencyResolver: AndroidLabyrinthCurrencyResolver,
     private val roleRewardNameResolver: AndroidLabyrinthRoleRewardNameResolver,
     private val relicStackResolver: AndroidLabyrinthRelicStackResolver,
     private val nodeRelicStackResolver: AndroidLabyrinthNodeRelicStackResolver,
     private val relicDetailResolver: AndroidLabyrinthRelicDetailResolver,
     private val skipJoinedCharacters: () -> Boolean,
     private val shopTitleTemplate: PixelImage,
+    private val shopStockEpoch: () -> Long,
+    private val shopPurchasedSlots: () -> Set<String>,
+    private val shopRuntime: AndroidShopOcrRuntime,
+    private val shopWalletReadRequired: () -> Boolean,
+    private val onShopWalletChanged: () -> Unit,
 ) {
-    private val currencyResolver = AndroidLabyrinthCurrencyResolver()
-    private val shopPriceResolver = AndroidLabyrinthShopPriceResolver()
     private val shopTitleMatcher = GradientTemplateMatcher()
+
+    private val shopLifecycle = java.util.concurrent.atomic.AtomicLong()
+
+    fun clearShopOcr() {
+        shopLifecycle.incrementAndGet()
+        shopRuntime.coordinator.cancelAll()
+        shopItemResolver.clear()
+        currencyResolver.clear()
+    }
 
     fun process(frame: CapturedFrame): LabyrinthEntryFrameResult {
         val started = System.nanoTime()
-        val receipt = shopItemResolver.fastReceipt(frame.bitmap) {
+        val epoch = shopStockEpoch()
+        val lifecycle = shopLifecycle.get()
+        val fingerprints = AndroidFrameRoiFingerprints(frame.bitmap, frame.timestampMillis,
+            isCurrent = { shopLifecycle.get() == lifecycle && shopStockEpoch() == epoch },
+            performance = shopRuntime.performance)
+        shopItemResolver.bindStockEpoch(epoch)
+        val receipt = shopItemResolver.fastReceipt(frame.bitmap, fingerprints) {
             // 外框粗筛通过后只评分一个商店标题，不修改核心入口预缩及特别装备流程。
             val image = AndroidPixelImageAdapter.from(frame.bitmap)
             val rect = ReferenceFitMapper.map(image.width, image.height, EntryReferenceSize(1920, 1080),
                 EntryReferenceRect(850, 50, 220, 75))
             rect?.let { shopTitleMatcher.score(image, it, shopTitleTemplate) } ?: 0.0
         }?.let { receipt ->
-            shopPriceResolver.clear()
             currencyResolver.clear()
             val elapsed = (System.nanoTime() - started) / 1_000_000
             receipt.copy(elapsedMillis = elapsed, stageMillis = mapOf("shopReceiptFast" to elapsed))
         }
-        return resolveShopReceiptOrPage(receipt) { processPage(frame, started) }
+        val result = resolveShopReceiptOrPage(receipt, invalidateStock = shopItemResolver::clearStockTitles) { processPage(frame, started, fingerprints, epoch) }
+        return result.copy(shopObservation = result.shopObservation?.copy(stockEpoch = epoch))
     }
 
-    private fun processPage(frame: CapturedFrame, started: Long): LabyrinthEntryFrameResult {
+    private fun processPage(frame: CapturedFrame, started: Long, fingerprints: AndroidFrameRoiFingerprints,
+        epoch: Long): LabyrinthEntryFrameResult {
         val result = processor.process(
             AndroidPixelImageAdapter.from(frame.bitmap),
             deferRoleRewardPortraits = true,
@@ -273,7 +293,7 @@ class AndroidLabyrinthEntryFrameProcessor private constructor(
         val exResolved = exEncounterResolver.resolve(frame.bitmap, result)
         val exResolvedAt = System.nanoTime()
         val eventResolved = eventChoiceResolver?.resolve(frame.bitmap, exResolved) ?: exResolved
-        val shopResolved = shopItemResolver.resolve(frame.bitmap, eventResolved)
+        val shopResolved = shopItemResolver.resolve(frame.bitmap, eventResolved, fingerprints, shopPurchasedSlots())
         val roleResolved = roleRewardNameResolver.resolve(frame.bitmap, shopResolved)
         val relicStarted = System.nanoTime()
         val relicResolved = relicStackResolver.resolve(frame.bitmap, roleResolved)
@@ -281,8 +301,8 @@ class AndroidLabyrinthEntryFrameProcessor private constructor(
         val nodeResolved = nodeRelicStackResolver.resolve(frame.bitmap, relicResolved)
         val detailStarted = System.nanoTime()
         val detailResolved = relicDetailResolver.resolve(frame.bitmap, nodeResolved)
-        val priceResolved = shopPriceResolver.resolve(frame.bitmap, detailResolved)
-        val resolved = currencyResolver.resolve(frame.bitmap, priceResolved)
+        val resolved = currencyResolver.resolve(frame.bitmap, detailResolved, fingerprints, epoch,
+            ordinaryShopRequired = shopWalletReadRequired(), onShopWalletChanged = onShopWalletChanged)
         val finished = System.nanoTime()
         return resolved.copy(
             elapsedMillis = (finished - started) / 1_000_000,
@@ -303,6 +323,10 @@ class AndroidLabyrinthEntryFrameProcessor private constructor(
             characterAttributes: Map<String, LabyrinthCharacterAttribute?> = emptyMap(),
             finalBossOnly: () -> Boolean = { false },
             skipJoinedCharacters: () -> Boolean = { false },
+            shopStockEpoch: () -> Long = { 0L },
+            shopPurchasedSlots: () -> Set<String> = { emptySet() },
+            shopWalletReadRequired: () -> Boolean = { true },
+            onShopWalletChanged: () -> Unit = {},
             nodeSearchHint: () -> NodeSearchHint? = { null },
             nodeScanRequested: () -> Boolean = { true },
             nodeScanConsumable: () -> Boolean = { true },
@@ -324,6 +348,9 @@ class AndroidLabyrinthEntryFrameProcessor private constructor(
             val characterTemplates = AndroidLabyrinthBattleTeamTemplateLoader(context).load(characterAttributes)
             val characterIconMatcher = LabyrinthCharacterIconMatcher(characterTemplates)
             val characterRecognizer = LabyrinthCharacterRecognizer(characterIconMatcher)
+            val paddle = PaddleReceiptOcr(context)
+            val shopTextOcr = PaddleShopTextOcr(paddle)
+            val shopRuntime = AndroidShopOcrRuntime(paddle, shopTextOcr::readAsync, ShopPerformance.recorder)
             return AndroidLabyrinthEntryFrameProcessor(
                 processor = LabyrinthEntryFrameProcessor(
                     templates = entryTemplates,
@@ -354,7 +381,10 @@ class AndroidLabyrinthEntryFrameProcessor private constructor(
                         AndroidLabyrinthEventRecognitionDataLoader(context).load(),
                     )
                 }.getOrNull(),
-                shopItemResolver = AndroidLabyrinthShopItemResolver(paddle = PaddleReceiptOcr(context)),
+                shopItemResolver = AndroidLabyrinthShopItemResolver(submitTextRead = shopTextOcr::readAsync,
+                    paddle = paddle, runtime = shopRuntime),
+                currencyResolver = AndroidLabyrinthCurrencyResolver(submitShopTextRead = shopTextOcr::readAsync)
+                    .apply { useShopRuntime(shopRuntime) },
                 roleRewardNameResolver = AndroidLabyrinthRoleRewardNameResolver(
                     names = characterTemplates.map {
                         LabyrinthCharacterNameCandidate(it.characterId, it.displayName, it.aliases)
@@ -368,6 +398,11 @@ class AndroidLabyrinthEntryFrameProcessor private constructor(
                 relicDetailResolver = AndroidLabyrinthRelicDetailResolver(),
                 skipJoinedCharacters = skipJoinedCharacters,
                 shopTitleTemplate = entryTemplates[EntryAnchorId.SHOP_TITLE],
+                shopStockEpoch = shopStockEpoch,
+                shopPurchasedSlots = shopPurchasedSlots,
+                shopRuntime = shopRuntime,
+                shopWalletReadRequired = shopWalletReadRequired,
+                onShopWalletChanged = onShopWalletChanged,
             )
         }
     }

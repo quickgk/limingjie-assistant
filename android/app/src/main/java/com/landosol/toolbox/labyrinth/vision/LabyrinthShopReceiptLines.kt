@@ -3,9 +3,8 @@ package com.landosol.toolbox.labyrinth.vision
 /**
  * 回执各字段在 1920×1080 参考坐标里的位置。
  *
- * 主读按这些矩形逐块裁剪交给 PP-OCRv4；未配置 Paddle 引擎时退回拼图路径：把这几块分别裁出来、
- * 放大后排进一张白底拼图（六行，行高固定），再整图 OCR 一次，每个字段只面对自己那一行文字，
- * 不再被模态弹窗的蓝底标题、金色边框、圆点分隔线干扰。
+ * 主读按前五个矩形逐块裁剪；拼图退路也只填充前五行，第六行保留为空。
+ * 固定行序保证缺读不会将其他字段前移。
  * 顺序即字段与拼图的行序：0 标题、1 花费、2 商品、3 前余额、4 后余额、5 确认按钮。
  */
 internal val LABYRINTH_SHOP_RECEIPT_COLLAGE_FIELDS = listOf(
@@ -82,7 +81,7 @@ internal fun shopReceiptFromCollageRows(
         item = read(2),
         balanceBefore = read(3),
         balanceAfter = read(4),
-        // 按钮只作诊断证据：弹窗身份由标题与确认矩形几何证明，不再靠这两个字兜底。
+        // 按钮只作诊断证据：弹窗身份由标题与确认矩形几何证明。
         button = read(LABYRINTH_SHOP_RECEIPT_BUTTON_ROW),
         confirmRect = confirmRect,
     )
@@ -117,6 +116,9 @@ internal class LabyrinthShopReceiptReadState(private val clock: () -> Long) {
     private var mlkitRows: List<String?>? = null
     /** 当前主读引擎名；由解析器在切换引擎时写入，只为诊断。 */
     private var primaryEngineName: String? = null
+    private var observedHeadingFingerprint: Long? = null
+    private var observedContentFingerprint: Long? = null
+    private var contentGeneration = 0L
     var receipt: LabyrinthShopPurchaseReceiptObservation? = null
         private set
 
@@ -133,6 +135,19 @@ internal class LabyrinthShopReceiptReadState(private val clock: () -> Long) {
         confirmations = 0
         attempts = 0
         nextStart = 0
+        observedHeadingFingerprint = null
+        observedContentFingerprint = null
+    }
+
+    /** A proven other dialog is keyed only by its exact heading until the next title probe. */
+    fun requestContent(headingFingerprint: Long, contentFingerprint: Long): Request? {
+        val other = receipt?.heading?.let { it.confirmations >= 2 &&
+            it.text?.filterNot(Char::isWhitespace) in setOf("更新确认", "商店确认", "退出确认") } == true
+        if (observedHeadingFingerprint != headingFingerprint ||
+            (!other && observedContentFingerprint != contentFingerprint)) contentGeneration++
+        observedHeadingFingerprint = headingFingerprint
+        observedContentFingerprint = contentFingerprint
+        return request(contentGeneration)
     }
 
     /** 主读读数已提交，结果还没回来。 */
@@ -224,13 +239,20 @@ internal class LabyrinthShopReceiptReadState(private val clock: () -> Long) {
         confirmRect: EntryPixelRect?,
     ) = completeRows(request, lines?.let(::shopReceiptCollageRowTexts), confirmRect)
 
+    fun isCurrent(request: Request): Boolean = requests.isCurrent(request.ticket)
+
+    /** 主读结果落地；取消只释放旧请求，不累计读数或重试预算。 */
+    fun cancel(request: Request) {
+        if (requests.complete(request.ticket)) attempts = (attempts - 1).coerceAtLeast(0)
+    }
+
     /** 主读结果落地。行序固定为 [LABYRINTH_SHOP_RECEIPT_COLLAGE_FIELDS] 的顺序。 */
     fun completeRows(
         request: Request,
         rows: List<String?>?,
         confirmRect: EntryPixelRect?,
-    ) {
-        if (!requests.complete(request.ticket) || rows == null) return
+    ): Boolean {
+        if (!requests.complete(request.ticket) || rows == null) return false
         val parsed = shopReceiptFromCollageRows(rows, request.ticket.evidenceId, 1, confirmRect)
         val facts = listOf(parsed.heading?.text, parsed.itemName, parsed.spent?.toString(),
             parsed.before?.toString(), parsed.after?.toString())
@@ -239,5 +261,8 @@ internal class LabyrinthShopReceiptReadState(private val clock: () -> Long) {
         receipt = shopReceiptFromCollageRows(rows, request.ticket.evidenceId, confirmations, confirmRect)
         rawRows = rows
         if (receipt?.verified == true) verifiedAt = clock()
+        if (confirmations >= 2 && rows.getOrNull(0)?.filterNot(Char::isWhitespace) in
+            setOf("更新确认", "商店确认", "退出确认")) nextStart = clock() + 1_500
+        return true
     }
 }

@@ -1514,13 +1514,17 @@ class LabyrinthSpecialEquipmentSessionFlowTest {
         kind: LabyrinthCombatKind?,
         settings: LabyrinthStrategySettings?,
     ): LabyrinthEntryRecognitionSession {
-        val manager = AutomationSessionManager()
+        val now = java.util.concurrent.atomic.AtomicLong(0L)
+        val manager = AutomationSessionManager(now::get)
+        LabyrinthBattleUiTestClock.start(manager)
         val session = LabyrinthEntryRecognitionSession(
             sessionManager = manager,
             processorFactory = { { error("测试不投喂帧") } },
             actionExecutor = SessionBoundActionExecutor(manager) { AutomationBackendResult.Completed },
             actionsAvailable = { true },
+            clock = now::get,
         )
+        LabyrinthBattleUiTestClock.register(session, now)
         setField(session, "activeSessionId", SESSION_ID)
         setField(session, "specialEquipmentSettings", settings)
         if (kind != null) setField(session, "combatContext", LabyrinthCombatContext(kind))
@@ -1815,8 +1819,8 @@ class LabyrinthSpecialEquipmentSessionFlowTest {
     /**
      * 放掉单动作锁（`actionInFlight`）。
      *
-     * 真实运行时由动作协程的 finally 释放；单元测试里动作只会在无会话的后端上得到 `StaleSession`，
-     * 释放时机不确定，所以需要连续两次派发的用例显式放锁，断言才是确定性的。
+     * Test fixtures now use a real active manager and await completed callbacks. Explicit release
+     * remains only for cases that intentionally installed a synthetic occupied latch.
      */
     private fun releaseActionLatch(session: Any) {
         setField(session, "actionInFlight", java.util.concurrent.atomic.AtomicBoolean(false))
@@ -1867,6 +1871,7 @@ class LabyrinthSpecialEquipmentSessionFlowTest {
      * 编译后既可能被拆成 `long`、方法名也可能被加后缀改写，两种形态都支持）。
      */
     private fun invoke(session: Any, name: String, vararg arguments: Any?): Any? {
+        LabyrinthBattleUiTestClock.before(session, name, arguments)
         val all = session.javaClass.declaredMethods.filter { it.name.startsWith(name) }
         val method = all.firstOrNull {
             (it.name == name || it.name.startsWith("$name-")) && it.parameterCount == arguments.size
@@ -1885,7 +1890,9 @@ class LabyrinthSpecialEquipmentSessionFlowTest {
                 else -> argument
             }
         }.toTypedArray()
-        return method.invoke(session, *adapted)
+        val result = method.invoke(session, *adapted)
+        LabyrinthBattleUiTestClock.after(session)
+        return result
     }
 
     private companion object {

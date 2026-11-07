@@ -17,6 +17,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.landosol.toolbox.account.AccountListItem
 import com.landosol.toolbox.labyrinth.LabyrinthBossTeamMode
 import com.landosol.toolbox.labyrinth.LabyrinthCombatKind
 import com.landosol.toolbox.labyrinth.LabyrinthRelicMark
@@ -44,6 +45,7 @@ fun LabyrinthStrategySettingsScreen(
     onSave: (LabyrinthStrategySettings) -> Unit,
     onClose: () -> Unit,
     loadRoleRatings: suspend () -> List<LabyrinthRoleRatingItem> = { emptyList() },
+    accounts: List<AccountListItem> = emptyList(),
 ) {
     var draft by rememberSaveable(stateSaver = StrategySaver) { mutableStateOf(saved) }
     var section by rememberSaveable { mutableStateOf("评分") }
@@ -77,7 +79,7 @@ fun LabyrinthStrategySettingsScreen(
         ) { padding ->
             Column(Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("全局配置 · 所有账号共用。保存后从下次启动识别/自动执行生效，当前任务不变。",
+                Text("策略由所有账号共用；商店节点折扣按账号单独设置。保存后从下次启动生效，当前任务不变。",
                     style = MaterialTheme.typography.bodyMedium)
                 StrategySection("评分", "玩家评分 ${draft.playerWeight}% · 系统权重自动归一化", section, { section = it }) {
                     OutlinedButton(onClick = { showRoleRatings = true }, enabled = !saving,
@@ -193,9 +195,33 @@ fun LabyrinthStrategySettingsScreen(
                     )
                 }
                 StrategySection("商店", if (draft.buyRelics) "购买遗物 · ${if (draft.refreshShop) "区域 ${draft.refreshFromArea} 起刷新" else "不刷新"}" else "不购买", section, { section = it }) {
-                    Text("遗物始终优先；达到允许刷新起始区域后，本轮遗物买完或当前商品行已无可购买遗物且刷新可用时，继续花300金币刷新。只有遗物/刷新都无法继续时，才用剩余金币购买已确认的职能印记。无法确认的商品不会盲买。")
+                    Text("按核实余额选择预算组合；区域3不买3星，区域5在两次成功刷新后或无法有效刷新时放开3星。刷新须同时留足后续购货资金，首次300、第二次600，每店最多两次，区域3最多一次，区域4不买不刷。")
                     StrategySwitch("购买遗物", "关闭后退出商店，也不会刷新。", draft.buyRelics, !saving) { draft = draft.copy(buyRelics = it) }
-                    StrategySwitch("允许商店刷新", "买完当前可确认遗物后，才考虑花费 300 金币刷新。", draft.refreshShop, !saving && draft.buyRelics) { draft = draft.copy(refreshShop = it) }
+                    StrategySwitch("允许商店刷新", "刷新费不参与商品折扣，首次300、第二次600。", draft.refreshShop, !saving && draft.buyRelics) { draft = draft.copy(refreshShop = it) }
+                    Text("随机印记职能优先级", style = MaterialTheme.typography.titleSmall)
+                    Text("只影响随机印记。留空时攻击、破防、强化、增益、减益同组优先，其余同组；同组按商品位。部分配置优先按你的顺序，未配置职能仍保留购买资格。预算与身份核验始终优先。")
+                    RandomImprintPriorityEditor(draft.randomImprintRolePriority, !saving) {
+                        draft = draft.copy(randomImprintRolePriority = it)
+                    }
+                    Text("账号商店折扣 · α强化节点21（商品价格降低25%）", style = MaterialTheme.typography.titleSmall)
+                    Text("仅勾选已经取得节点21的账号。未勾选按未取得计算，应用不会自动读取游戏强化状态；下次启动按实际运行账号固定折扣。")
+                    if (accounts.isEmpty()) Text("尚无已保存账号，请先添加账号。")
+                    accounts.forEach { account ->
+                        val acquired = account.id in draft.node21AcquiredAccountIds
+                        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).toggleable(
+                            value = acquired, enabled = !saving, role = Role.Checkbox,
+                            onValueChange = { checked ->
+                                draft = draft.copy(node21AcquiredAccountIds = if (checked)
+                                    draft.node21AcquiredAccountIds + account.id else draft.node21AcquiredAccountIds - account.id)
+                            },
+                        ), verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = acquired, onCheckedChange = null, enabled = !saving)
+                            Column(Modifier.weight(1f)) {
+                                Text(account.alias.ifBlank { "账号${account.id}" })
+                                Text("${account.serverName} · #${account.id}", style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
                     if (draft.buyRelics && draft.refreshShop) {
                         StrategyNumber("允许刷新起始区域", draft.refreshFromArea, 1..5, "", !saving) { draft = draft.copy(refreshFromArea = it) }
                         if (draft.refreshFromArea < 5) Text("提前刷新会消耗后续商店的金币，请谨慎调整。", color = MaterialTheme.colorScheme.error)
@@ -367,6 +393,29 @@ private fun RelicPriorityEditor(
             TextButton(onClick = { onChange(emptyList()) }, enabled = enabled) { Text("恢复内置顺序") }
         }
     }
+}
+
+@Composable
+private fun RandomImprintPriorityEditor(
+    priority: List<com.landosol.toolbox.labyrinth.LabyrinthImprintRole>, enabled: Boolean,
+    onChange: (List<com.landosol.toolbox.labyrinth.LabyrinthImprintRole>) -> Unit,
+) {
+    priority.forEachIndexed { index, role ->
+        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("${index + 1}. ${role.label}", Modifier.weight(1f))
+            TextButton(onClick = { onChange(priority.toMutableList().also { it.add(index - 1, it.removeAt(index)) }) },
+                enabled = enabled && index > 0) { Text("上移") }
+            TextButton(onClick = { onChange(priority - role) }, enabled = enabled) { Text("移除") }
+        }
+    }
+    com.landosol.toolbox.labyrinth.LabyrinthImprintRole.entries.filterNot { it in priority }.chunked(3).forEach { row ->
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            row.forEach { role ->
+                OutlinedButton(onClick = { onChange(priority + role) }, enabled = enabled) { Text("添加${role.label}") }
+            }
+        }
+    }
+    if (priority.isNotEmpty()) TextButton(onClick = { onChange(emptyList()) }, enabled = enabled) { Text("恢复内置分组") }
 }
 
 @Composable

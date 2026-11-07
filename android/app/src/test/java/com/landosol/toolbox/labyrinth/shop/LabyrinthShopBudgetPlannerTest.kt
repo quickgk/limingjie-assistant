@@ -7,7 +7,7 @@ import com.landosol.toolbox.labyrinth.vision.LabyrinthShopCategoryState
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemKind
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemMatch
 import com.landosol.toolbox.labyrinth.vision.LabyrinthShopItemStatus
-import com.landosol.toolbox.labyrinth.vision.LabyrinthShopReceiptRead
+
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -69,14 +69,17 @@ class LabyrinthShopBudgetPlannerTest {
         assertEquals("z", result.selected.single().slotId)
     }
 
-    @Test fun `四层位按强化加速会心守备弱体的源顺序比较`() {
+    @Test fun `四层属性位遵守显式遗物配置顺序`() {
         val priority = listOf(LabyrinthRelicMark.ENHANCEMENT, LabyrinthRelicMark.ACCELERATION,
             LabyrinthRelicMark.CRITICAL, LabyrinthRelicMark.DEFENSE, LabyrinthRelicMark.DEBUFF)
         for (index in 0 until priority.lastIndex) {
             val higher = priority[index]
             val lower = priority[index + 1]
-            val result = plan(listOf(relic("a", 100, lower), relic("z", 100, higher)), 100,
-                mapOf(higher to 3, lower to 3))
+            val stacks = mapOf(higher to 3, lower to 3)
+            val policy = com.landosol.toolbox.labyrinth.LabyrinthRelicChoicePolicy(
+                com.landosol.toolbox.labyrinth.LabyrinthRelicChoicePolicyConfig(markPriority = priority))
+            val result = LabyrinthShopBudgetPlanner.plan(listOf(relic("a", 100, lower), relic("z", 100, higher)), 100,
+                stacks, null, false, policy.attributePriorityGroups(stacks))
             assertEquals(higher.label, result.selected.single().relicMatch!!.attribute)
         }
     }
@@ -120,11 +123,11 @@ class LabyrinthShopBudgetPlannerTest {
         assertFalse(LabyrinthShopBudgetPlanner.eligible(relic("unknown", 100).copy(kind = LabyrinthShopItemKind.UNKNOWN)))
     }
 
-    @Test fun `未知价格未双读及未完成身份读取均不进入已知库存`() {
+    @Test fun `未知价格零价不上架及未完成身份读取均不进入已知库存`() {
         val known = relic("known", 100)
         val result = plan(listOf(known,
-            relic("unknown", 100).copy(priceRead = null),
-            relic("single-read", 100).copy(priceRead = LabyrinthShopReceiptRead("100", 1, 1)),
+            relic("unknown", 100).copy(price = null),
+            relic("not-listed", 0),
             relic("reading", 100).copy(categoryState = LabyrinthShopCategoryState.READING)), 1_000)
         assertEquals(listOf("known"), result.selected.map { it.slotId })
     }
@@ -213,6 +216,6 @@ class LabyrinthShopBudgetPlannerTest {
     private fun item(id: String, price: Long, kind: LabyrinthShopItemKind) = LabyrinthShopItemMatch(
         slotId = id, screenRect = rect, buyButtonRect = rect, buyButtonScore = 0.9,
         buyButtonEnabledEvidence = 1.0, status = LabyrinthShopItemStatus.AVAILABLE, kind = kind,
-        priceRead = LabyrinthShopReceiptRead(price.toString(), 1L, 2),
+        price = price,
     )
 }

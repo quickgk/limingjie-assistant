@@ -1,0 +1,189 @@
+{
+  "schemaVersion": 1,
+  "summonUnits": [
+    {
+      "id": "11000999",
+      "name": "公主庆典的选择印记",
+      "summonType": 1,
+      "summonNum": 1,
+      "price": 3600,
+      "description": "能够从公主庆典的角色中选出1人成为同伴。"
+    },
+    {
+      "id": "11001000",
+      "name": "攻击型职能的选择印记",
+      "summonType": 1,
+      "summonNum": 1,
+      "price": 2800,
+      "description": "能够从攻击型职能中选出1人成为同伴。"
+    },
+    {
+      "id": "11002000",
+      "name": "破防型职能的选择印记",
+      "summonType": 1,
+      "summonNum": 1,
+      "price": 2800,
+      "description": "能够从破防型职能中选出1人成为同伴。"
+    },
+    {
+      "id": "11003000",
+      "name": "增益型职能的选择印记",
+      "summonType": 1,
+      "summonNum": 1,
+      "price": 2800,
+      "description": "能够从增益型职能中选出1人成为同伴。"
+    },
+    {
+      "id": "11004000",
+      "name": "减益型职能的选择印记",
+      "summonType": 1,
+      "summonNum": 1,
+      "price": 2800,
+      "description": "能够从减益型职能中选出1人成为同伴。"
+    },
+    {
+      "id": "11005000",
+      "name": "强化型职能的选择印记",
+      "summonType": 1,
+      "summonNum": 1,
+      "price": 2800,
+      "description": "能够从强化型职能中选出1人成为同伴。"
+    },
+    {
+      "id": "11006000",
+      "name": "治疗型职能的选择印记",
+      "summonType": 1,
+      "summonNum": 1,
+      "price": 2800,
+      "description": "能够从治疗型职能中选出1人成为同伴。"
+    },
+    {
+      "id": "11007000",
+      "name": "坦克型职能的选择印记",
+      "summonType": 1,
+      "summonNum": 1,
+      "price": 2800,
+      "description": "能够从坦克型职能中选出1人成为同伴。"
+    },
+    {
+      "id": "11008000",
+      "name": "干扰型职能的选择印记",
+      "summonType": 1,
+      "summonNum": 1,
+      "price": 2800,
+      "description": "能够从干扰型职能中选出1人成为同伴。"
+    },
+    {
+      "id": "31000999",
+      "name": "公主庆典的随机印记",
+      "summonType": 3,
+      "summonNum": 1,
+      "price": 1800,
+      "description": "能够从公主庆典的角色中随机选出1人成为同伴。"
+    },
+    {
+      "id": "31001000",
+      "name": "攻击型职能的随机印记",
+      "summonType": 3,
+      "summonNum": 1,
+      "price": 1200,
+      "description": "能够从攻击型职能中随机选出1人成为同伴。"
+    },
+    {
+      "id": "31002000",
+      "name": "破防型职能的随机印记",
+      "summonType": 3,
+      "summonNum": 1,
+      "price": 1200,
+      "description": "能够从破防型职能中随机选出1人成为同伴。"
+    },
+    {
+      "id": "31003000",
+      "name": "增益型职能的随机印记",
+      "summonType": 3,
+      "summonNum": 1,
+      "price": 1200,
+      "description": "能够从增益型职能中随机选出1人成为同伴。"
+    },
+    {
+      "id": "31004000",
+      "name": "减益型职能的随机印记",
+      "summonType": 3,
+      "summonNum": 1,
+      "price": 1200,
+      "description": "能够从减益型职能中随机选出1人成为同伴。"
+    },
+    {
+      "id": "31005000",
+      "name": "强化型职能的随机印记",
+      "summonType": 3,
+      "summonNum": 1,
+      "price": 1200,
+      "description": "能够从强化型职能中随机选出1人成为同伴。"
+    },
+    {
+      "id": "31006000",
+      "name": "治疗型职能的随机印记",
+      "summonType": 3,
+      "summonNum": 1,
+      "price": 1200,
+      "description": "能够从治疗型职能中随机选出1人成为同伴。"
+    },
+    {
+      "id": "31007000",
+      "name": "坦克型职能的随机印记",
+      "summonType": 3,
+      "summonNum": 1,
+      "price": 1200,
+      "description": "能够从坦克型职能中随机选出1人成为同伴。"
+    },
+    {
+      "id": "31008000",
+      "name": "干扰型职能的随机印记",
+      "summonType": 3,
+      "summonNum": 1,
+      "price": 1200,
+      "description": "能够从干扰型职能中随机选出1人成为同伴。"
+    },
+    {
+      "id": "31100000",
+      "name": "火属性的随机印记",
+      "summonType": 3,
+      "summonNum": 1,
+      "price": 1200,
+      "description": "能够从火属性的角色中随机选出1人成为同伴。"
+    },
+    {
+      "id": "31200000",
+      "name": "水属性的随机印记",
+      "summonType": 3,
+      "summonNum": 1,
+      "price": 1200,
+      "description": "能够从水属性的角色中随机选出1人成为同伴。"
+    },
+    {
+      "id": "31300000",
+      "name": "风属性的随机印记",
+      "summonType": 3,
+      "summonNum": 1,
+      "price": 1200,
+      "description": "能够从风属性的角色中随机选出1人成为同伴。"
+    },
+    {
+      "id": "31400000",
+      "name": "光属性的随机印记",
+      "summonType": 3,
+      "summonNum": 1,
+      "price": 1200,
+      "description": "能够从光属性的角色中随机选出1人成为同伴。"
+    },
+    {
+      "id": "31500000",
+      "name": "暗属性的随机印记",
+      "summonType": 3,
+      "summonNum": 1,
+      "price": 1200,
+      "description": "能够从暗属性的角色中随机选出1人成为同伴。"
+    }
+  ]
+}
